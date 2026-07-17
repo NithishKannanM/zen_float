@@ -98,7 +98,7 @@ class FloatWindow {
   #floatTab = null;
   #browser = null;
   #container = null;
-  #tabSelectHandler = null;
+  #enrollment = null; // ZF-021 render-contract maintainer (borrows the host handle)
 
   get hasBrowser() {
     return !!this.#browser;
@@ -195,15 +195,18 @@ class FloatWindow {
       this.#floatTab = tab;
       this.#floatTab.setAttribute("zen-float-tab", "true"); // keep it out of the tab strip
       this.#browser = tab.linkedBrowser;
-      this.#activate(); // render while unselected (EXP-002C)
-      // No-move: style the tab's OWN container; do not reparent the browser.
+      // No-move: style the tab's OWN container for float GEOMETRY (positioning only).
       this.#container = this.#browser.closest(".browserSidebarContainer");
       if (this.#container) {
         this.#container.classList.add(FloatWindow.BROWSER_CLASS);
       }
-      // Keep the float rendering when other tabs are selected (Glance also listens on window).
-      this.#tabSelectHandler = () => this.#activate();
-      window.addEventListener("TabSelect", this.#tabSelectHandler);
+      // Render enrollment + compositing + persistence are owned by EnrollmentManager (ZF-021).
+      this.#enrollment = new EnrollmentManager(() => this.detach());
+      this.#enrollment.enroll({
+        tab: this.#floatTab,
+        browser: this.#browser,
+        container: this.#container,
+      });
       this.show();
       return this.#browser;
     } catch (_) {
@@ -212,30 +215,18 @@ class FloatWindow {
     }
   }
 
-  #activate() {
-    try {
-      if (this.#browser) {
-        this.#browser.docShellIsActive = true;
-      }
-    } catch (_) {}
-  }
-
-  /** Tear down the hosted browser (no-move reverse): unlisten, unclass, remove tab, hide. */
+  /** Tear down the hosted browser (no-move reverse): unenroll, unclass, remove tab, hide. */
   detach() {
-    if (this.#tabSelectHandler) {
-      window.removeEventListener("TabSelect", this.#tabSelectHandler);
-      this.#tabSelectHandler = null;
+    // EnrollmentManager clears deck-selected + docShellIsActive + zenModeActive and disarms hooks.
+    if (this.#enrollment) {
+      this.#enrollment.destroy();
+      this.#enrollment = null;
     }
     if (this.#container) {
-      this.#container.classList.remove(FloatWindow.BROWSER_CLASS);
+      this.#container.classList.remove(FloatWindow.BROWSER_CLASS); // positioning class (FloatWindow's)
       this.#container = null;
     }
-    if (this.#browser) {
-      try {
-        this.#browser.docShellIsActive = false;
-      } catch (_) {}
-      this.#browser = null;
-    }
+    this.#browser = null;
     if (this.#floatTab) {
       try {
         window.gBrowser?.removeTab(this.#floatTab);
