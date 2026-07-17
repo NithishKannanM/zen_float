@@ -214,6 +214,9 @@ class nsZenFloatManager {
   }
 
   // ---- lifecycle --------------------------------------------------------
+  // C2 — guarantee init() runs exactly once regardless of when this script loads relative
+  // to window startup: normal startup, late injection (notification already fired),
+  // secondary windows, and restored sessions.
   #armReadyHook() {
     this.#readyObserver = {
       observe: (subject, topic) => {
@@ -224,12 +227,33 @@ class nsZenFloatManager {
         }
       },
     };
+
+    // Subscribe FIRST so there is no gap between the already-fired check and subscription.
+    let subscribed = false;
     try {
       Services.obs.addObserver(this.#readyObserver, nsZenFloatManager.READY_TOPIC);
+      subscribed = true;
     } catch (e) {
-      // If the observer can't be added, fall back to a best-effort late init so the
-      // script still functions (worst case: slightly earlier than ideal).
       this.#log("WARN could not subscribe to", nsZenFloatManager.READY_TOPIC, "-", e.message);
+    }
+
+    // Already-fired guard: if this window's delayed startup is already complete, the
+    // notification is gone and the observer would never fire — init now. init() is
+    // idempotent, so a redundant observer callback afterwards is harmless.
+    let alreadyFinished = false;
+    try {
+      alreadyFinished = window.gBrowserInit?.delayedStartupFinished === true;
+    } catch (_) {
+      alreadyFinished = false;
+    }
+    if (alreadyFinished) {
+      this.#disarmReadyHook();
+      this.init();
+      return;
+    }
+
+    // Neither the observer nor the readiness flag was usable — last-resort late init.
+    if (!subscribed) {
       window.addEventListener("load", () => this.init(), { once: true });
     }
   }
