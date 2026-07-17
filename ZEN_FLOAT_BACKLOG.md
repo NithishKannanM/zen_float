@@ -121,7 +121,8 @@
 ## Epic E2 — Persistent Browser Host
 
 ### ZF-020 — Spawn nested `<browser>` via Glance recipe
-- **Desc:** Implement `FloatWindow.spawn(url)` using the exact addTab options `{skipRoute:true, skipAnimation:true, skipBackgroundNotify:true, insertTab:true, ownerTab, triggeringPrincipal, userContextId}`; attach into `.zen-float-overlay`; load `about:blank` then target.
+- **C1 no-move model (REQUIRED):** do **not** attach/move the `<browser>` into `.zen-float-overlay`. Spawn the float tab, then apply class `.zen-float-browser` to its **own** `.browserSidebarContainer` (Glance's `.zen-glance-overlay` pattern) so its inner `.browserContainer` floats via the shared `--zen-float-*` geometry vars. `.zen-float-overlay` stays a chrome frame only.
+- **Desc:** Implement `FloatWindow.attachTarget(url)` using the exact addTab options `{skipRoute:true, skipAnimation:true, skipBackgroundNotify:true, insertTab:true, ownerTab, triggeringPrincipal, userContextId}`; set `linkedBrowser.docShellIsActive=true`; apply the no-move float class to the tab's container; load `about:blank` then target.
 - **Motivation:** the core capability; reuse not re-derive (EDD §2.1, §5, ADR-002).
 - **Deps:** ZF-002, EXP-002.
 - **AC:** a live `<browser>` renders inside the overlay; not shown in tab strip; loads a URL.

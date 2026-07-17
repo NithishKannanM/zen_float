@@ -7,8 +7,13 @@
 // ==/UserScript==
 //
 // ZF-001 — Bootstrap: manager scaffold + feature flag + ready hook.
-// ZF-002 — Overlay skeleton: FloatWindow shell (hidden .zen-float-overlay host).
-// Still no nested <browser> / UI — that is ZF-020 (uses the EXP-002 host recipe).
+// ZF-002 — Overlay skeleton: FloatWindow shell (hidden .zen-float-overlay chrome frame).
+// C1     — No-move host model (Glance-faithful). The nested <browser> is NEVER reparented.
+//          .zen-float-overlay is a CHROME FRAME only. ZF-020 will style the float tab's OWN
+//          .browserSidebarContainer as the float (class .zen-float-browser), exactly like
+//          Glance's .zen-glance-overlay: the inner .browserContainer is positioned fixed
+//          using the SAME --zen-float-* geometry vars the frame reads, so frame and browser
+//          align with no imperative syncing. Still no <browser>/UI yet — that is ZF-020.
 //
 // Grounded in live-runtime findings (EXP-001/002, Zen 1.21.6b):
 //   - Safe init hook = "browser-delayed-startup-finished" (fires post session-restore,
@@ -22,31 +27,69 @@
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
 
 /**
- * ZF-002 — FloatWindow (shell only).
- * Owns the `.zen-float-overlay` host element (position:fixed, hidden by default),
- * mirroring Glance's overlay contract. No nested <browser> yet — that lands in ZF-020,
- * which will attach a browser built with the recipe validated in EXP-002.
+ * FloatWindow — the float's CHROME FRAME (C1 no-move model).
+ *
+ * Owns a single `.zen-float-overlay` element: a position:fixed chrome frame (border,
+ * shadow, and later the title bar / resize handles), hidden by default. It NEVER hosts
+ * the nested <browser>. Per the C1 contract, ZF-020 will style the float tab's OWN
+ * `.browserSidebarContainer` (class `.zen-float-browser`) so its inner `.browserContainer`
+ * is positioned fixed via the same `--zen-float-*` geometry vars — the browser aligns with
+ * this frame automatically and is never moved in the DOM (mirrors Glance's overlay).
+ *
+ * Frozen public API (ZF-020 review): ensureShell / show / hide / toggle / visible / destroy.
  */
 class FloatWindow {
-  static OVERLAY_CLASS = "zen-float-overlay";
+  static OVERLAY_CLASS = "zen-float-overlay"; // the chrome frame element
+  static BROWSER_CLASS = "zen-float-browser"; // C1 contract: applied by ZF-020 to the float
+  //                                             tab's .browserSidebarContainer. Inert here.
   static STYLE_ID = "zen-float-styles";
   static STYLES = `
+    :root {
+      /* Single source of truth for float geometry. DockController (ZF-040) updates these.
+         Both the chrome frame and the (never-moved) browser container read them, so they
+         stay aligned with no imperative syncing. */
+      --zen-float-width: 420px;
+      --zen-float-height: 640px;
+      --zen-float-inset-block-end: 24px;
+      --zen-float-inset-inline-end: 24px;
+      --zen-float-radius: 12px;
+      --zen-float-z: 2147483646;
+    }
+
+    /* Chrome frame ONLY — never a <browser> parent. */
     .zen-float-overlay {
       position: fixed;
-      inset: auto 24px 24px auto;      /* bottom-right default; DockController owns this later */
-      width: 420px; height: 640px;
+      inset: auto var(--zen-float-inset-inline-end) var(--zen-float-inset-block-end) auto;
+      width: var(--zen-float-width);
+      height: var(--zen-float-height);
       min-width: 280px; min-height: 360px;
-      z-index: 2147483646;
-      border-radius: 12px;
+      z-index: var(--zen-float-z);
+      border-radius: var(--zen-float-radius);
       overflow: hidden;
       background: Field;
       box-shadow: 0 12px 48px rgba(0, 0, 0, 0.35);
       contain: layout style;           /* isolate from page layout */
     }
     .zen-float-overlay[hidden] { display: none; }
+
+    /* C1 no-move contract (applied by ZF-020, inert until then). Mirrors Glance:
+       the float tab's own .browserSidebarContainer becomes the float; the inner
+       .browserContainer is positioned fixed with the SAME geometry vars as the frame. */
+    .browserSidebarContainer.zen-float-browser {
+      visibility: visible !important;
+      z-index: var(--zen-float-z);
+      overflow: visible !important;
+    }
+    .browserSidebarContainer.zen-float-browser .browserContainer {
+      position: fixed;
+      inset: auto var(--zen-float-inset-inline-end) var(--zen-float-inset-block-end) auto;
+      width: var(--zen-float-width);
+      height: var(--zen-float-height);
+      flex: unset !important;
+    }
   `;
 
-  #overlay = null;
+  #frame = null;
 
   #injectStyles() {
     if (document.getElementById(FloatWindow.STYLE_ID)) {
@@ -58,34 +101,38 @@ class FloatWindow {
     document.documentElement.appendChild(style);
   }
 
-  /** Create the hidden overlay host if absent. Idempotent. */
+  /** Create the hidden chrome frame if absent. Idempotent. Attach point owned by C3. */
   ensureShell() {
-    if (this.#overlay && this.#overlay.isConnected) {
-      return this.#overlay;
+    if (this.#frame && this.#frame.isConnected) {
+      return this.#frame;
     }
     this.#injectStyles();
-    const host = document.getElementById("tabbrowser-tabpanels") || document.documentElement;
     const el = document.createElementNS(XHTML_NS, "div");
     el.className = FloatWindow.OVERLAY_CLASS;
     el.setAttribute("hidden", "true");
-    host.appendChild(el);
-    this.#overlay = el;
+    this.#attachHost().appendChild(el);
+    this.#frame = el;
     return el;
   }
 
+  /** Attach host for the chrome frame. C3 replaces the body with the vetted node. */
+  #attachHost() {
+    return document.getElementById("tabbrowser-tabpanels") || document.documentElement;
+  }
+
   get visible() {
-    return !!this.#overlay && !this.#overlay.hasAttribute("hidden");
+    return !!this.#frame && !this.#frame.hasAttribute("hidden");
   }
 
   show() {
     this.ensureShell();
-    this.#overlay.removeAttribute("hidden");
+    this.#frame.removeAttribute("hidden");
     return this.visible;
   }
 
   hide() {
-    if (this.#overlay) {
-      this.#overlay.setAttribute("hidden", "true");
+    if (this.#frame) {
+      this.#frame.setAttribute("hidden", "true");
     }
     return this.visible;
   }
@@ -94,11 +141,11 @@ class FloatWindow {
     return this.visible ? this.hide() : this.show();
   }
 
-  /** Full teardown — remove the overlay (styles left; cheap and shared). */
+  /** Full teardown — remove the frame (shared styles left in place; cheap). */
   destroy() {
-    if (this.#overlay) {
-      this.#overlay.remove();
-      this.#overlay = null;
+    if (this.#frame) {
+      this.#frame.remove();
+      this.#frame = null;
     }
   }
 }
