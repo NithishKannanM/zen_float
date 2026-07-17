@@ -417,6 +417,7 @@ class EnrollmentManager {
   // Synchronous, pre-paint backstop: if any third party (split/customize/restore/deck)
   // strips deck-selected, restore it before the frame paints → no flicker.
   #armObserver() {
+    this.#disarmObserver(); // idempotent: never orphan a prior observer
     const c = this.#container();
     if (!c || typeof MutationObserver === "undefined") {
       return;
@@ -442,6 +443,7 @@ class EnrollmentManager {
 
   // Approved hooks ONLY: TabSelect, Workspace, MozDOMFullscreen, Customize Mode, unload.
   #armListeners() {
+    this.#disarmListeners(); // idempotent: never double-register
     const add = (target, type, fn, opts) => {
       target.addEventListener(type, fn, opts);
       this.#listeners.push({ target, type, fn, opts });
