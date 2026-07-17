@@ -148,3 +148,14 @@ Console logs / perf / memory: **not collected** (no headful run).
 **To reach sign-off:** execute §1 P0 rows in a real Zen window after a one-time loader install. Everything needed is scripted/checklisted above; the only true dependency is a display + sudo — neither available to QA autonomously.
 
 **Do not begin ZF-021 until items 1–4 are closed.**
+
+---
+
+## ADDENDUM — Loader validated + a real defect found (portable-Zen test rig)
+
+Set up a **no-sudo portable test env** (`~/zen-float-test/`: Zen 1.21.7b tarball + fx-autoconfig, isolated from the daily flatpak). Results:
+
+- **A1 LOADER — PASS (previously BLOCKED).** fx-autoconfig loaded the real `zen-float.uc.mjs`; init ran at delayed-startup: `[ZenFloat] init — internals present; overlay shell ready`. Marionette confirmed `gZenFloatManager` (ctor `nsZenFloatManager`), `enabledPref:true`, `hasFloatWindow:true`, `frameInDOM:true`. The ship mechanism works, no sudo, no app-dir hack.
+- **DEFECT F-1 (P0) — placeholder frame occludes the browser.** `document.elementFromPoint` at the float center returns `.zen-float-overlay` with `background: rgb(255,255,255)` (opaque). The no-move browser floats at the same rect *behind* the opaque frame → `openFloat()` shows a blank white box, not the page. Root cause: ZF-002's placeholder frame has an opaque fill and equal z-index; it was never meant to sit over the browser. **Fix (ZF-021+ / ZF-020 follow-up, NOT this task):** make the frame a border/titlebar with a transparent content region (or stack the browser above the frame). Workaround for manual testing: hide the frame (`.zen-float-overlay{display:none}`) to view the browser.
+
+This does not change the ZF-020 verdict (**NO — not production-ready**); it adds a concrete, now-visible P0 defect and closes the A1 blocker.
