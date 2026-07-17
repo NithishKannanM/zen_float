@@ -58,5 +58,23 @@ One section per blocker. Each was resolved as an independent, self-contained com
 
 ---
 
-## C3 — Overlay attachment
-(see the C3 commit / section appended below when implemented)
+## C3 — Overlay attachment (commit `C3: attach frame to document root`)
+
+**Problem:** ZF-002 attached the frame to `#tabbrowser-tabpanels` — a tab deck that hides non-selected panels and sits under Zen's animated (transformed) chrome. A transformed ancestor makes `position: fixed` anchor to that ancestor, not the viewport → hidden/clipped/mispositioned float.
+
+### Evaluation
+
+| Candidate | Tab-independent | `fixed` safe | Transform-safe | Glance-safe | Verdict |
+|---|---|---|---|---|---|
+| `#tabbrowser-tabpanels` | ❌ deck hides non-selected | ⚠️ | ❌ animated | ⚠️ | **Reject** |
+| `#navigator-toolbox` | ✅ | ❌ | ❌ compact-mode animates | ✅ | **Reject** |
+| `#mainPopupSet` | ✅ | ✅ | ✅ | ✅ | Reject — popup semantics, not persistent content |
+| `#browser` / `#appcontent` | ✅ | mostly | ⚠️ descendant transforms | ✅ | Weaker than root |
+| **`document.documentElement`** | ✅ | ✅ guaranteed | ✅ absolute | ✅ | **Choose** |
+
+**Decision:** `document.documentElement`. As the DOM root it can have no ancestor, so `position: fixed` is guaranteed viewport-relative and immune to compact-mode / workspace / glance transforms. Tab-independent, outside Glance's subtree, and a platform invariant (not a Zen id) → most update-proof.
+
+**Residual (headful-validate, deferred to ZF-020):** the no-move browser container must remain in `#tabbrowser-tabpanels`. Steady-state: neither is transformed → both viewport-anchored → aligned. Transient Zen animations could momentarily drift the browser from the root-anchored frame. Mitigation if visible: co-locate chrome inside the browser container (Glance-exact). Inherent to no-move; shared with Glance.
+
+**Regression:** frame moves from tabpanels to the document root; both are inert while hidden and flag-gated. No interaction with tabs/Glance/split/spaces. Rollback: `git revert` the C3 commit → frame re-attaches to tabpanels.
+**DoD:** frame attaches to the document root; `position: fixed` viewport-anchored; `node --check` passes; Zen functional flag on/off.

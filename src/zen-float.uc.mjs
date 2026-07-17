@@ -101,7 +101,7 @@ class FloatWindow {
     document.documentElement.appendChild(style);
   }
 
-  /** Create the hidden chrome frame if absent. Idempotent. Attach point owned by C3. */
+  /** Create the hidden chrome frame if absent. Idempotent. */
   ensureShell() {
     if (this.#frame && this.#frame.isConnected) {
       return this.#frame;
@@ -115,9 +115,16 @@ class FloatWindow {
     return el;
   }
 
-  /** Attach host for the chrome frame. C3 replaces the body with the vetted node. */
+  // C3 — attach point for the chrome frame. `document.documentElement` is the only node
+  // where position:fixed is *guaranteed* viewport-relative: as the DOM root it can never
+  // have a transformed/filtered/contained ancestor, so the frame is immune to Zen's
+  // compact-mode / workspace / glance transforms. It is tab-independent, outside Glance's
+  // subtree, and a platform invariant (not a Zen-private id) — maximally update-proof.
+  // Rejected: #tabbrowser-tabpanels (deck hides non-selected panels; animated),
+  // #navigator-toolbox (compact-mode animated), #browser/#appcontent (descendant
+  // transforms possible), #mainPopupSet (popup semantics). See reviews/BLOCKER-RESOLUTIONS.md.
   #attachHost() {
-    return document.getElementById("tabbrowser-tabpanels") || document.documentElement;
+    return document.documentElement;
   }
 
   get visible() {
