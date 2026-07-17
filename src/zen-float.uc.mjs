@@ -256,6 +256,7 @@ class nsZenFloatManager {
   static PREF_ENABLED = "zen.float.enabled";
   static PREF_DEBUG = "zen.float.debug";
   static READY_TOPIC = "browser-delayed-startup-finished";
+  static DEFAULT_TARGET = "https://claude.ai/"; // single default until TargetRegistry (ZF-022)
 
   // Zen internals ZF depends on. Presence is feature-detected at init so a browser
   // update that renames one degrades gracefully (disable + notice) instead of throwing.
@@ -424,6 +425,56 @@ class nsZenFloatManager {
     const visible = this.floatWindow.toggle();
     this.#log("_debugToggleOverlay:", visible ? "shown" : "hidden");
     return visible;
+  }
+
+  /**
+   * ZF-020 — open the single float on `url` (default target if omitted). Spawns a live
+   * nested <browser> via the no-move model. Returns true on success. Idempotent-ish:
+   * a second open while one exists is a no-op at the FloatWindow layer (cap = 1).
+   */
+  openFloat(url) {
+    if (!this.floatWindow) {
+      this.#log("openFloat: not initialized (need zen.float.enabled + internals present)");
+      return false;
+    }
+    const target = url || nsZenFloatManager.DEFAULT_TARGET;
+    const browser = this.floatWindow.attachTarget(target);
+    if (!browser) {
+      this.#log("openFloat: spawn failed for", target);
+      return false;
+    }
+    this.#log(
+      "openFloat",
+      target,
+      "browsingContext=" + !!browser.browsingContext,
+      "active=" + browser.docShellIsActive
+    );
+    return true;
+  }
+
+  /** ZF-020 — close the float and tear down its browser. */
+  closeFloat() {
+    if (!this.floatWindow) {
+      return;
+    }
+    this.floatWindow.detach();
+    this.#log("closeFloat: detached");
+  }
+
+  /**
+   * ZF-020 debug: toggle a REAL float (spawns/closes a live browser) from the Browser
+   * Console. Distinct from _debugToggleOverlay (which only toggles the empty chrome frame).
+   */
+  _debugToggleFloat(url) {
+    if (!this.floatWindow) {
+      this.#log("_debugToggleFloat: no floatWindow (enabled + init?)");
+      return false;
+    }
+    if (this.floatWindow.hasBrowser) {
+      this.closeFloat();
+      return false;
+    }
+    return this.openFloat(url);
   }
 
   #detectCapabilities() {
