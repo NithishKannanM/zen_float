@@ -126,6 +126,7 @@
 - **Motivation:** the core capability; reuse not re-derive (EDD §2.1, §5, ADR-002).
 - **Deps:** ZF-002, EXP-002.
 - **AC:** a live `<browser>` renders inside the overlay; not shown in tab strip; loads a URL.
+- **Status (implemented `031751e`/`5ed25b0`/`6780c59`):** API + CSS **verified** on Zen 1.21.6b (browsingContext+active, container computes `position:fixed`/`visibility:visible`, tab `display:none`, 15-switch persistence, clean detach; Glance ignores it via `glanceId:null`). Direct `docShellIsActive=true` after `addTab` suffices (no select-once). **Visual paint = pending headful.** See `reviews/ZF-020-REPORT.md`.
 - **DoD (add):** uses EXP-002's chosen host recipe; docshell activated on show.
 - **Complexity:** L · **LOC:** ~200 · **Time:** 2d · **Risk:** **High**.
 - **Files:** `zen-float.uc.mjs`. **Classes:** `FloatWindow` (spawn/attach/show/hide). **Affected:** none in Zen core (v1).
