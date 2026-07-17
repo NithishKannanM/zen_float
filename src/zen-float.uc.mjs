@@ -255,6 +255,240 @@ class FloatWindow {
   }
 }
 
+/**
+ * ZF-021 — EnrollmentManager.
+ * Maintains ONLY the proven render contract for one borrowed BrowserHost handle:
+ *   render enrollment  = `deck-selected` on the .browserSidebarContainer
+ *   content compositing = docShellIsActive === true
+ *   persistence         = zenModeActive === true   (survives AsyncTabSwitcher deselection)
+ * It does NOT own the BrowserHost: it never creates/removes tabs and never writes
+ * gBrowser.selectedTab. Design: design/ZF-021-RENDER-LIFECYCLE.md. All methods idempotent;
+ * event-driven only (no timers, no polling, no retries).
+ */
+class EnrollmentManager {
+  static ENROLL_CLASS = "deck-selected"; // NOT zen-split (owned by Split View)
+
+  #handle = null; // borrowed { tab, browser, container }
+  #state = "detached"; // detached | rendered | hidden
+  #classObserver = null;
+  #listeners = []; // [{ target, type, fn, opts }]
+  #wsFn = null;
+  #dirty = false;
+  #onFatal = null;
+
+  constructor(onFatal = null) {
+    this.#onFatal = onFatal;
+  }
+
+  get state() {
+    return this.#state;
+  }
+
+  // Re-resolve the container each time: a deck rebuild (split/customize/restore) can
+  // replace the .browserSidebarContainer element under a stable <browser>.
+  #container() {
+    const b = this.#handle && this.#handle.browser;
+    let c = null;
+    try {
+      c = b && b.closest && b.closest(".browserSidebarContainer");
+    } catch (_) {}
+    return c || (this.#handle && this.#handle.container) || null;
+  }
+
+  // Idempotent, conditional writes only (no write when already satisfied → no layout thrash).
+  #applyContract() {
+    const h = this.#handle;
+    if (!h || !h.browser) {
+      return;
+    }
+    const c = this.#container();
+    if (c) {
+      h.container = c;
+      if (!c.classList.contains(EnrollmentManager.ENROLL_CLASS)) {
+        c.classList.add(EnrollmentManager.ENROLL_CLASS);
+      }
+    }
+    try {
+      if (h.browser.zenModeActive !== true) {
+        h.browser.zenModeActive = true;
+      }
+    } catch (_) {}
+    try {
+      if (h.browser.docShellIsActive !== true) {
+        h.browser.docShellIsActive = true;
+      }
+    } catch (_) {}
+  }
+
+  #clearContract({ compositing = true } = {}) {
+    const h = this.#handle;
+    if (!h) {
+      return;
+    }
+    const c = this.#container();
+    if (c && c.classList.contains(EnrollmentManager.ENROLL_CLASS)) {
+      c.classList.remove(EnrollmentManager.ENROLL_CLASS);
+    }
+    if (compositing && h.browser) {
+      try {
+        if (h.browser.docShellIsActive) {
+          h.browser.docShellIsActive = false;
+        }
+      } catch (_) {}
+      try {
+        if (h.browser.zenModeActive) {
+          h.browser.zenModeActive = false;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // ---- public API ----
+  enroll(handle) {
+    if (this.#handle && this.#handle !== handle) {
+      this.unenroll();
+    }
+    this.#handle = handle;
+    this.#applyContract();
+    this.#state = "rendered";
+    this.#armObserver(); // after the initial apply, so our own add doesn't self-trigger
+    this.#armListeners();
+    return this.#state;
+  }
+
+  unenroll() {
+    this.#disarmObserver();
+    this.#disarmListeners();
+    this.#clearContract();
+    this.#handle = null;
+    this.#state = "detached";
+  }
+
+  reassert() {
+    if (this.#state !== "rendered") {
+      return false;
+    }
+    this.#applyContract();
+    return true;
+  }
+
+  suspend() {
+    if (!this.#handle || this.#state === "hidden") {
+      return;
+    }
+    this.#clearContract({ compositing: true });
+    this.#state = "hidden";
+  }
+
+  resume() {
+    if (!this.#handle || this.#state === "rendered") {
+      return;
+    }
+    this.#applyContract();
+    this.#state = "rendered";
+  }
+
+  destroy() {
+    this.unenroll();
+    this.#onFatal = null;
+  }
+
+  isRendered() {
+    const h = this.#handle;
+    if (!h || !h.browser) {
+      return false;
+    }
+    const c = this.#container();
+    let dsa = false;
+    let zma = false;
+    try {
+      dsa = h.browser.docShellIsActive === true;
+    } catch (_) {}
+    try {
+      zma = h.browser.zenModeActive === true;
+    } catch (_) {}
+    return !!(c && c.classList.contains(EnrollmentManager.ENROLL_CLASS) && dsa && zma);
+  }
+
+  // Coalesce synchronous event bursts (e.g. rapid TabSelect) into one reassert via the
+  // microtask queue. A microtask is not a timer/poll; it drains after the current task.
+  #scheduleReassert() {
+    if (this.#dirty) {
+      return;
+    }
+    this.#dirty = true;
+    Promise.resolve().then(() => {
+      this.#dirty = false;
+      this.reassert();
+    });
+  }
+
+  // Synchronous, pre-paint backstop: if any third party (split/customize/restore/deck)
+  // strips deck-selected, restore it before the frame paints → no flicker.
+  #armObserver() {
+    const c = this.#container();
+    if (!c || typeof MutationObserver === "undefined") {
+      return;
+    }
+    this.#classObserver = new MutationObserver(() => {
+      if (this.#state !== "rendered") {
+        return;
+      }
+      const cc = this.#container();
+      if (cc && !cc.classList.contains(EnrollmentManager.ENROLL_CLASS)) {
+        this.#applyContract();
+      }
+    });
+    this.#classObserver.observe(c, { attributes: true, attributeFilter: ["class"] });
+  }
+
+  #disarmObserver() {
+    if (this.#classObserver) {
+      this.#classObserver.disconnect();
+      this.#classObserver = null;
+    }
+  }
+
+  // Approved hooks ONLY: TabSelect, Workspace, MozDOMFullscreen, Customize Mode, unload.
+  #armListeners() {
+    const add = (target, type, fn, opts) => {
+      target.addEventListener(type, fn, opts);
+      this.#listeners.push({ target, type, fn, opts });
+    };
+    add(window, "TabSelect", () => this.#scheduleReassert());
+    add(window, "MozDOMFullscreen:Entered", () => this.suspend());
+    add(window, "MozDOMFullscreen:Exited", () => this.resume());
+    const toolbox = window.gNavToolbox || document.getElementById("navigator-toolbox");
+    if (toolbox) {
+      add(toolbox, "customizationstarting", () => this.suspend());
+      add(toolbox, "aftercustomization", () => this.resume());
+    }
+    add(window, "unload", () => this.destroy());
+    try {
+      const ws = window.gZenWorkspaces;
+      if (ws && typeof ws.addChangeListeners === "function") {
+        this.#wsFn = () => this.#scheduleReassert();
+        ws.addChangeListeners(this.#wsFn, { once: false });
+      }
+    } catch (_) {}
+  }
+
+  #disarmListeners() {
+    for (const { target, type, fn, opts } of this.#listeners) {
+      try {
+        target.removeEventListener(type, fn, opts);
+      } catch (_) {}
+    }
+    this.#listeners = [];
+    if (this.#wsFn) {
+      try {
+        window.gZenWorkspaces?.removeChangeListeners?.(this.#wsFn);
+      } catch (_) {}
+      this.#wsFn = null;
+    }
+  }
+}
+
 class nsZenFloatManager {
   // ---- constants --------------------------------------------------------
   static PREF_ENABLED = "zen.float.enabled";
