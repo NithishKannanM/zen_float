@@ -90,6 +90,16 @@ class FloatWindow {
   `;
 
   #frame = null;
+  // ZF-020 browser hosting (no-move). The <browser> stays owned by #tabbrowser-tabpanels;
+  // we only add a class to its OWN .browserSidebarContainer and keep its docshell active.
+  #floatTab = null;
+  #browser = null;
+  #container = null;
+  #tabSelectHandler = null;
+
+  get hasBrowser() {
+    return !!this.#browser;
+  }
 
   #injectStyles() {
     if (document.getElementById(FloatWindow.STYLE_ID)) {
@@ -148,8 +158,92 @@ class FloatWindow {
     return this.visible ? this.hide() : this.show();
   }
 
-  /** Full teardown — remove the frame (shared styles left in place; cheap). */
+  /**
+   * ZF-020 — spawn ONE nested <browser> for `url` using the EXP-002 recipe and render it
+   * via the C1 no-move model: the browser stays in its own tab container; we add
+   * `.zen-float-browser` to that container so its inner `.browserContainer` floats via the
+   * shared geometry vars. The browser is NEVER moved. Returns the browser, or null on failure.
+   * Single float (cap = 1): a second call while one is open is a no-op.
+   */
+  attachTarget(url) {
+    if (this.#browser) {
+      return this.#browser;
+    }
+    const gBrowser = window.gBrowser;
+    if (!gBrowser) {
+      return null;
+    }
+    this.ensureShell();
+
+    let tab;
+    try {
+      tab = gBrowser.addTab(url, {
+        triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+        skipBackgroundNotify: true,
+        insertTab: true,
+        skipAnimation: true,
+        ownerTab: gBrowser.selectedTab,
+      });
+    } catch (_) {
+      return null; // caller logs; leave the frame shell intact (transactional).
+    }
+
+    try {
+      this.#floatTab = tab;
+      this.#browser = tab.linkedBrowser;
+      this.#activate(); // render while unselected (EXP-002C)
+      // No-move: style the tab's OWN container; do not reparent the browser.
+      this.#container = this.#browser.closest(".browserSidebarContainer");
+      if (this.#container) {
+        this.#container.classList.add(FloatWindow.BROWSER_CLASS);
+      }
+      // Keep the float rendering when other tabs are selected (Glance also listens on window).
+      this.#tabSelectHandler = () => this.#activate();
+      window.addEventListener("TabSelect", this.#tabSelectHandler);
+      this.show();
+      return this.#browser;
+    } catch (_) {
+      this.detach(); // roll back any partial attach
+      return null;
+    }
+  }
+
+  #activate() {
+    try {
+      if (this.#browser) {
+        this.#browser.docShellIsActive = true;
+      }
+    } catch (_) {}
+  }
+
+  /** Tear down the hosted browser (no-move reverse): unlisten, unclass, remove tab, hide. */
+  detach() {
+    if (this.#tabSelectHandler) {
+      window.removeEventListener("TabSelect", this.#tabSelectHandler);
+      this.#tabSelectHandler = null;
+    }
+    if (this.#container) {
+      this.#container.classList.remove(FloatWindow.BROWSER_CLASS);
+      this.#container = null;
+    }
+    if (this.#browser) {
+      try {
+        this.#browser.docShellIsActive = false;
+      } catch (_) {}
+      this.#browser = null;
+    }
+    if (this.#floatTab) {
+      try {
+        window.gBrowser?.removeTab(this.#floatTab);
+      } catch (_) {}
+      this.#floatTab = null;
+    }
+    this.hide();
+  }
+
+  /** Full teardown — detach the browser, then remove the frame (shared styles left in place). */
   destroy() {
+    this.detach();
     if (this.#frame) {
       this.#frame.remove();
       this.#frame = null;
