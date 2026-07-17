@@ -87,6 +87,9 @@ class FloatWindow {
       height: var(--zen-float-height);
       flex: unset !important;
     }
+
+    /* The float's tab is a real tab (no-move) but must not clutter the tab strip. */
+    [zen-float-tab="true"] { display: none !important; }
   `;
 
   #frame = null;
@@ -190,6 +193,7 @@ class FloatWindow {
 
     try {
       this.#floatTab = tab;
+      this.#floatTab.setAttribute("zen-float-tab", "true"); // keep it out of the tab strip
       this.#browser = tab.linkedBrowser;
       this.#activate(); // render while unselected (EXP-002C)
       // No-move: style the tab's OWN container; do not reparent the browser.
