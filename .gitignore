@@ -1,3 +1,7 @@
 .DS_Store
 scratchpad/
 *.tmpprofile
+
+# graphify generated graph (regenerate with: graphify update .)
+graphify-out/
+raw/
