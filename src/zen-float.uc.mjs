@@ -27,6 +27,107 @@
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
 
 /**
+ * ZF-022a — BrowserHost. Owns the float's hidden tab and its `<browser>`, and is the ONLY
+ * component that holds a strong browser reference or calls browser APIs.
+ *
+ * Extracted from FloatWindow (ZF-020) with NO behavioural change: same EXP-002 spawn recipe,
+ * same C1 no-move model (the `<browser>` is never reparented), same teardown semantics
+ * including the ZF-021d fatal path (`removeTab:false`).
+ *
+ * Deliberately does NOT: write rendering attributes (EnrollmentManager owns deck-selected /
+ * docShellIsActive / zenModeActive), style anything (FloatWindow owns the geometry class), or
+ * read page metadata (TargetRegistry owns that — it borrows the browser through this host).
+ */
+class BrowserHost {
+  static TAB_ATTR = "zen-float-tab"; // hides the tab from the strip (CSS, ZF-020c)
+
+  #tab = null;
+  #browser = null;
+  #container = null; // the tab's OWN .browserSidebarContainer (never reparented)
+
+  get alive() {
+    return !!this.#browser;
+  }
+  get tab() {
+    return this.#tab;
+  }
+  get browser() {
+    return this.#browser;
+  }
+  get container() {
+    return this.#container;
+  }
+
+  /**
+   * Spawn the hidden tab + browser via the EXP-002 recipe. Idempotent: a second call while
+   * one is alive returns the existing browser (single float, cap = 1). Returns null on
+   * failure, leaving nothing behind (transactional).
+   */
+  spawn(url) {
+    if (this.#browser) {
+      return this.#browser;
+    }
+    const gBrowser = window.gBrowser;
+    if (!gBrowser) {
+      return null;
+    }
+    let tab;
+    try {
+      tab = gBrowser.addTab(url, {
+        triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+        skipBackgroundNotify: true,
+        insertTab: true,
+        skipAnimation: true,
+        ownerTab: gBrowser.selectedTab,
+      });
+    } catch (_) {
+      return null; // caller logs
+    }
+    this.#tab = tab;
+    this.#tab.setAttribute(BrowserHost.TAB_ATTR, "true");
+    this.#browser = tab.linkedBrowser;
+    this.#container = this.#browser.closest(".browserSidebarContainer");
+    return this.#browser;
+  }
+
+  /** Borrowed handle for EnrollmentManager (ZF-021). The host stays the owner. */
+  handle() {
+    return { tab: this.#tab, browser: this.#browser, container: this.#container };
+  }
+
+  /**
+   * ZF-022 — reload the hosted page. The only navigation API the float exposes in this
+   * milestone; FloatChrome reaches it through FloatWindow and never holds a browser.
+   */
+  reload() {
+    try {
+      this.#browser?.reload();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Drop the tab + browser. `removeTab:false` is the ZF-021d fatal path (tabbrowser is
+   * already closing our tab — see FloatWindow.detach for why re-entering removeTab there
+   * corrupts tabbrowser's close sequence). References are nulled before the removal so a
+   * re-entrant teardown finds nothing to do.
+   */
+  teardown({ removeTab = true } = {}) {
+    const tab = this.#tab;
+    this.#browser = null;
+    this.#container = null;
+    this.#tab = null;
+    if (tab && removeTab) {
+      try {
+        window.gBrowser?.removeTab(tab);
+      } catch (_) {}
+    }
+  }
+}
+
+/**
  * FloatWindow — the float's CHROME FRAME (C1 no-move model).
  *
  * Owns a single `.zen-float-overlay` element: a position:fixed chrome frame (border,
@@ -92,16 +193,21 @@ class FloatWindow {
     [zen-float-tab="true"] { display: none !important; }
   `;
 
+  // Composition + lifecycle only (ZF-022 ownership matrix):
+  //   BrowserHost → browser instance | EnrollmentManager → rendering attributes
+  //   TargetRegistry → metadata      | FloatChrome → presentation | FloatWindow → this
   #frame = null;
-  // ZF-020 browser hosting (no-move). The <browser> stays owned by #tabbrowser-tabpanels;
-  // we only add a class to its OWN .browserSidebarContainer and keep its docshell active.
-  #floatTab = null;
-  #browser = null;
-  #container = null;
+  #host = new BrowserHost(); // ZF-022a: owns the tab + <browser> (no-move)
   #enrollment = null; // ZF-021 render-contract maintainer (borrows the host handle)
+  #geometryTarget = null; // the node WE classed with .zen-float-browser (geometry is ours)
 
   get hasBrowser() {
-    return !!this.#browser;
+    return this.#host.alive;
+  }
+
+  /** Read-only access for the manager's debug/logging paths. Never handed to Chrome. */
+  get host() {
+    return this.#host;
   }
 
   #injectStyles() {
@@ -169,47 +275,29 @@ class FloatWindow {
    * Single float (cap = 1): a second call while one is open is a no-op.
    */
   attachTarget(url) {
-    if (this.#browser) {
-      return this.#browser;
-    }
-    const gBrowser = window.gBrowser;
-    if (!gBrowser) {
-      return null;
+    if (this.#host.alive) {
+      return this.#host.browser;
     }
     this.ensureShell();
 
-    let tab;
-    try {
-      tab = gBrowser.addTab(url, {
-        triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
-        skipBackgroundNotify: true,
-        insertTab: true,
-        skipAnimation: true,
-        ownerTab: gBrowser.selectedTab,
-      });
-    } catch (_) {
+    const browser = this.#host.spawn(url);
+    if (!browser) {
       return null; // caller logs; leave the frame shell intact (transactional).
     }
 
     try {
-      this.#floatTab = tab;
-      this.#floatTab.setAttribute("zen-float-tab", "true"); // keep it out of the tab strip
-      this.#browser = tab.linkedBrowser;
       // No-move: style the tab's OWN container for float GEOMETRY (positioning only).
-      this.#container = this.#browser.closest(".browserSidebarContainer");
-      if (this.#container) {
-        this.#container.classList.add(FloatWindow.BROWSER_CLASS);
+      // We cache the node we classed — the host may drop its reference before we unclass.
+      this.#geometryTarget = this.#host.container;
+      if (this.#geometryTarget) {
+        this.#geometryTarget.classList.add(FloatWindow.BROWSER_CLASS);
       }
       // Render enrollment + compositing + persistence are owned by EnrollmentManager (ZF-021).
       // onFatal = "our tab is being closed by someone else": tear down without touching the tab.
       this.#enrollment = new EnrollmentManager(() => this.detach({ removeTab: false }));
-      this.#enrollment.enroll({
-        tab: this.#floatTab,
-        browser: this.#browser,
-        container: this.#container,
-      });
+      this.#enrollment.enroll(this.#host.handle());
       this.show();
-      return this.#browser;
+      return browser;
     } catch (_) {
       this.detach(); // roll back any partial attach
       return null;
@@ -231,20 +319,17 @@ class FloatWindow {
       this.#enrollment.destroy();
       this.#enrollment = null;
     }
-    if (this.#container) {
-      this.#container.classList.remove(FloatWindow.BROWSER_CLASS); // positioning class (FloatWindow's)
-      this.#container = null;
+    if (this.#geometryTarget) {
+      this.#geometryTarget.classList.remove(FloatWindow.BROWSER_CLASS); // geometry class (ours)
+      this.#geometryTarget = null;
     }
-    this.#browser = null;
-    if (this.#floatTab) {
-      if (removeTab) {
-        try {
-          window.gBrowser?.removeTab(this.#floatTab);
-        } catch (_) {}
-      }
-      this.#floatTab = null;
-    }
+    this.#host.teardown({ removeTab });
     this.hide();
+  }
+
+  /** Public close entry point (ZF-022). Routes through the one teardown path. */
+  close() {
+    this.detach();
   }
 
   /** Full teardown — detach the browser, then remove the frame (shared styles left in place). */
@@ -722,7 +807,7 @@ class nsZenFloatManager {
     if (!this.floatWindow) {
       return;
     }
-    this.floatWindow.detach();
+    this.floatWindow.close();
     this.#log("closeFloat: detached");
   }
 
