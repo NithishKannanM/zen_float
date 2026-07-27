@@ -41,5 +41,26 @@
 ## Console evidence
 `[ZenFloat] init — internals present; overlay shell ready (hidden).` on every launch (fx-autoconfig load). `zen.float.debug=true` in the test profile; no errors emitted during the matrix.
 
+---
+
+# ZF-021d — External float-tab close (C-1) validation
+
+**Build:** same rig, `zen-float.uc.mjs` @ ZF-021d, fx-autoconfig load path. **Driver:** Marionette chrome context, one `ExecuteAsyncScript` matrix.
+**New ground truth:** `listeners` = window listener census via `nsIEventListenerService.getListenerInfoFor(window)` for `TabSelect`/`TabClose` — a *direct* measurement of the C-1 leak claim, not an inference. `hasBrowser` = `FloatWindow.hasBrowser`; `floatTabs` = tabs with `[zen-float-tab]`; `floatClassContainers` = `.zen-float-browser` elements.
+
+| # | Scenario | Method | Expected | Observed | Verdict |
+|---|---|---|---|---|---|
+| S0 | Noise baseline (3 tab open/close, **no float**) | driven | attribute console errors | 3× `handleEvent is not callable` (1 per TabClose) → **pre-existing noise, not ZF** | **BASELINE** |
+| S10 | Float open | driven | contract holds, listeners 13/10→14/11 | `deck=t, dsa=t, zma=t, holds=t, selected=f`, `14/11` | **PASS** |
+| S11 | **Unrelated** tab closes | driven | float untouched (design §3) | `holds=t, hasBrowser=t, floatTabs=1`, listeners `14/11` | **PASS** |
+| S12 | **External close of the float tab** (`gBrowser.removeTab`, bypasses `detach`) | driven | `unenroll`+`onFatal`; no throw; no leak | `removeThrew=f`, `tabGone=t`, `hasBrowser=f`, `floatTabs=0`, `floatClassContainers=0`, overlay hidden, listeners **13/10** | **PASS** |
+| S13 | Post-fatal tab churn (×3) | driven | inert; no dead-handle writes/errors | no float artifacts; error rate identical to S0 baseline (3 for 3 closes) | **PASS** |
+| S14 | Re-open after fatal | driven | state clean, not wedged | `reopenOk=t`, `holds=t`, listeners back to `14/11` | **PASS** |
+| S15 | Owner close path + double close | driven | unchanged from S9 | `teardownClean=t`, `floatTabs=0`, listeners `13/10`, second `closeFloat()` no-op | **PASS** |
+
+**Defect found by driving this path (F-5, fixed):** the first ZF-021d build wired `onFatal → detach()`, whose `removeTab` re-entered `tabbrowser.removeTab` on an already-closing tab and ran `_endRemoveTab` inside the outer `_beginRemoveTab` → `removeThrew=true`, `TypeError: can't access property "removeProgressListener", browser.webProgress is undefined @ tabbrowser.js:6180`. Fixed via `detach({ removeTab:false })` on the fatal path; re-run is clean. Full analysis in `reviews/ZF-021-CODE-REVIEW.md` (addendum).
+
+**Coverage honesty (ZF-021d):** all rows above are **driven on a real build** (real `gBrowser.removeTab`, real `TabClose` dispatch, real listener census). The float tab was closed *by script* — equivalent to the "close other tabs"/session-op path at the tabbrowser level (same `removeTab` entry point), but the **UI** affordances ("Close Other Tabs" menu, session restore closing it) were **not** exercised. Tab **adoption into another window** (`TabClose` with `detail.adoptedBy`) is treated as fatal by construction and was **not** driven (headless second window).
+
 ## Verdict
-The proven render contract is **maintained across tab switching (ordinary + rapid), restored synchronously after external `deck-selected` removal, and correctly suspended/resumed on fullscreen and customize**, with **leak-free teardown** and **all four design invariants holding**. Residual coverage gaps (live workspace switch, live split/glance/fullscreen/customize UI, multi-window, session restore, OOP pixels) are environmental (headless / single-workspace) and, where load-bearing, are covered by their failure mode. See `reviews/ZF-021-CODE-REVIEW.md` for the adversarial review and the one open condition (TabClose/onFatal).
+The proven render contract is **maintained across tab switching (ordinary + rapid), restored synchronously after external `deck-selected` removal, and correctly suspended/resumed on fullscreen and customize**, with **leak-free teardown** and **all four design invariants holding**. Residual coverage gaps (live workspace switch, live split/glance/fullscreen/customize UI, multi-window, session restore, OOP pixels) are environmental (headless / single-workspace) and, where load-bearing, are covered by their failure mode. See `reviews/ZF-021-CODE-REVIEW.md` for the adversarial review. **The open condition (TabClose/onFatal) is closed as of ZF-021d — see the section above.**

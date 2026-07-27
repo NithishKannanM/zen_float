@@ -139,6 +139,7 @@
 - **AC:** after close, no retained docshell/blob/listener (EXP-006 harness passes); registry empties.
 - **Complexity:** M · **LOC:** ~120 · **Time:** 1d · **Risk:** Med.
 - **Files:** `zen-float.uc.mjs`. **Classes:** `FloatWindow`, `nsZenFloatManager` (registry). **Testing:** memory/leak (§9). **Review:** teardown completeness; registry keyed by id.
+- **Status (implemented `9123b45`/`a11e564`/`12eb683`/ZF-021d):** `EnrollmentManager` maintains the render contract across tab switching, workspace change, fullscreen/customize suspend-resume, and an external `deck-selected` strip (MutationObserver backstop); teardown is leak-free. **ZF-021d** closed review condition C-1 by restoring the design's `TabClose` hook (external float-tab close → `unenroll` + `onFatal`) and fixed **F-5** (re-entrant `removeTab` during `TabClose` corrupted tabbrowser's close sequence → `onFatal` now tears down without removing the tab). Listener census proves no per-window listener leak. **Design-complete for the render-lifecycle scope.** See `reviews/ZF-021-VALIDATION.md` + `reviews/ZF-021-CODE-REVIEW.md`. Multi-float registry (`Map<floatId, FloatWindow>`) is still deferred — cap is 1 float.
 
 ### ZF-022 — Target registry + title bar + Close
 - **Desc:** `TargetRegistry` with presets (Claude/ChatGPT/Gemini/Perplexity/DeepWiki/GitHub/Notion/Slack + custom URL); render title bar (target label, close). 

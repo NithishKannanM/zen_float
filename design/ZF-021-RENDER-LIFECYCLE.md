@@ -155,6 +155,7 @@ Each hook justified from shipped source; wrong hooks rejected.
 **Hidden float tab closed externally (e.g., "close other tabs", session op):**
 - **Detect:** `TabClose` whose target is the float tab.
 - **Recover:** `unenroll` (drop observer/listeners cleanly), fire `onFatal` → the owner decides recreate-vs-dismiss per policy. Guarantees no leaked observer referencing a dead tab and no orphaned `deck-selected`.
+- **Constraint on the owner (added ZF-021d, source-grounded):** the `onFatal` path **must not call `gBrowser.removeTab` on the float tab** — tabbrowser is already closing it. `TabClose` is dispatched from `_beginRemoveTab` *after* `aTab.closing = true` and *before any teardown* (`tabbrowser.js`), so a re-entrant `removeTab(tab)` takes the "synchronously remove an already asynchronously closing tab" fastpath — `if (!animate && aTab.closing) { this._endRemoveTab(aTab); return; }` (`animate` has **no default**, so it is `undefined` from a plain `removeTab(tab)` call) — and destroys the browser *inside* the outer `_beginRemoveTab`, which then throws `browser.webProgress is undefined`. The owner drops its references only; tabbrowser finishes the close. Verified on 1.21.7b (threw before the fix, clean after).
 
 ---
 

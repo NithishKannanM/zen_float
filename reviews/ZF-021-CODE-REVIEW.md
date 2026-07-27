@@ -3,7 +3,9 @@
 **Reviewer stance:** attempt to reject. Approve only if every design invariant (design/ZF-021-RENDER-LIFECYCLE.md §1) holds.
 **Under review:** `src/zen-float.uc.mjs` @ ZF-021c (`EnrollmentManager` + FloatWindow wiring). Commits `9123b45` (a), `a11e564` (b), `<idempotency>` (c).
 
-## Verdict: **APPROVE WITH ONE CONDITION**
+> **UPDATE (ZF-021d):** condition **C-1 is RESOLVED** by restoring the design's `TabClose` hook (option (a), the recommended one). Driving that path on the real build then exposed a **new defect (F-5)**, now fixed. Verdict upgraded to **APPROVED** — see the addendum at the end.
+
+## Verdict: **APPROVE WITH ONE CONDITION** *(superseded — see addendum)*
 
 Every rendering invariant (I1–I4) holds and is validated (ZF-021-VALIDATION.md). One self-review defect was found and fixed. One **design-vs-ticket conflict** remains open (C-1) and must be reconciled — it is not an invariant violation but an unimplemented design-mandated recovery path, forced by this ticket's hook constraint.
 
@@ -53,3 +55,33 @@ I tried to reject on: idempotency (found → **fixed**), timer/polling (**defend
 
 ## Approval
 **APPROVED WITH CONDITION C-1.** All rendering invariants I1–I4 hold and are validated. Merge-eligible for the render-lifecycle scope; **C-1 (TabClose/onFatal) must be reconciled** (restore the design's hook, or formally re-scope) before ZF-021 is declared design-complete. No other blocking findings. **Stop here — do not proceed to ZF-022.**
+
+---
+
+# Addendum — ZF-021d: C-1 reconciled, F-5 found and fixed
+
+**Under review:** `src/zen-float.uc.mjs` @ ZF-021d. **Evidence:** driven matrix on the portable 1.21.7b rig via fx-autoconfig + Marionette (`reviews/ZF-021-VALIDATION.md` §ZF-021d).
+
+### C-1 — RESOLVED (option (a): restore the design's hook)
+`EnrollmentManager` now hooks `window` `"TabClose"` and, when `event.target` is the float tab, runs the design's §6 recovery: **`unenroll` first** (drop observer/listeners/contract — never leave a live hook on a dead tab), **then** fire `onFatal` **once** (`#onFatal` is nulled before the call, so the owner's re-entrant `destroy()` cannot re-fire it). Any other tab closing is ignored (design §3: "TabClose (other tab) → none"). The `TabClose` hook is one of the design's *accepted* hooks (§4) — the ticket's narrower hook list was the deviation, and it is now reconciled toward the approved design.
+
+**Leak claim measured directly, not asserted:** window listener census via `nsIEventListenerService.getListenerInfoFor(window)` — `TabSelect`/`TabClose` counts go 13/10 (baseline) → 14/11 (float open) → **13/10 after an external close** and 13/10 after the owner path. The bounded per-window leak C-1 described is gone, by measurement.
+
+### F-5 — Re-entrant `removeTab` during `TabClose` corrupted tabbrowser's close sequence. **[FOUND BY DRIVING THE PATH — FIXED]**
+Wiring `onFatal` to `FloatWindow.detach()` (which removes the tab) was **wrong**, and only showed up once the path was actually driven:
+- `_beginRemoveTab` sets `aTab.closing = true`, then dispatches `TabClose` **before any teardown**.
+- Our handler → `onFatal` → `detach()` → `gBrowser.removeTab(floatTab)` → `removeTab`'s fastpath `if (!animate && aTab.closing) { this._endRemoveTab(aTab); return; }` (`animate` has **no default** → `undefined`) ran `_endRemoveTab` **synchronously inside the outer `_beginRemoveTab`**, destroying the browser mid-close.
+- The outer frame then threw: `TypeError: can't access property "removeProgressListener", browser.webProgress is undefined @ tabbrowser.js:6180`.
+- **Observed:** `removeThrew=true` on the first ZF-021d build. **Fix:** `detach({ removeTab })`; `onFatal = () => this.detach({ removeTab: false })` — the owner drops references, tabbrowser finishes its own close. **Re-run: `removeThrew=false`**, tab gone, state clean. Design §6 updated with the constraint.
+
+Note this defect was *latent in the C-1 recommendation itself* ("`onFatal` is wired (`() => this.detach()`)"): had the hook been added without driving it, the fatal path would have shipped throwing inside tabbrowser.
+
+### Console-error attribution (honesty check)
+A recurring `TypeError: Property 'handleEvent' is not callable.` appears in the headless log. Attributed by measurement, not assumption: a **no-float baseline** of 3 tab open/close cycles emits **3** of them — the same 1-per-`TabClose` rate observed with the float open and after the fatal path. **Pre-existing Zen/headless noise, not ZF.**
+
+### Re-checked findings
+- **F-1** (idempotency), **F-2/F-3/F-4** — unchanged; the new listener is armed/disarmed through the same idempotent `#armListeners`/`#disarmListeners` pair (census confirms no double-registration across open→close→re-open).
+- **I1–I4** — re-verified in the ZF-021d matrix (`floatTabSelected=false` throughout; contract holds at S1/T1/T4; cleanly absent after teardown).
+
+### Approval (updated)
+**APPROVED.** C-1 reconciled per the approved design; F-5 found by driving the previously-undriven path and fixed with a source-grounded change. ZF-021 is **design-complete** for the render-lifecycle scope. Remaining gaps are unchanged and documented (live workspace switch, live split/glance/fullscreen/customize UI, multi-window, session restore, OOP pixels).
