@@ -147,6 +147,8 @@
 - **AC:** switching target reloads browser; close destroys float; custom URL accepted/validated (http/https).
 - **Complexity:** M · **LOC:** ~140 · **Time:** 1d · **Risk:** Low.
 - **Files:** `zen-float.uc.mjs`, `zen-float.uc.css`. **New class:** `TargetRegistry`. **Testing:** UI + E3 site matrix (via EXP-003? no—via manual E3). **Review:** URL validation; extensible descriptor `{type:"web"|"internal"}` (EDD §13).
+- **Status (implemented `b386e12` + ZF-022):** delivered as the **float surface**, which differs from this entry — see `design/ADR-022-FLOAT-SURFACE.md`. Landed: `BrowserHost` (extracted from FloatWindow; owns tab + browser; adds `reload()`), `TargetRegistry` (**page-metadata layer**: url/title/favicon/loading + `lastUpdated`, `nsIWebProgressListener` + tab `TabAttrModified`, re-registers on `TabRemotenessChange`), `FloatChrome` (read-only title bar: favicon, title, throbber, reload, close), and `FloatWindow.close()`. Resolves defect **F-1** (frame no longer occludes the page). Validated 14/14 on the real build — `reviews/ZF-022-VALIDATION.md`, visual: `reviews/evidence/zf022-title-bar.png`.
+- **STILL OUTSTANDING from this ticket:** **target presets** (Claude/ChatGPT/… + custom URL) and target *switching* — the name `TargetRegistry` was taken by the metadata layer, so presets need a separate class (`TargetPresets`) and a follow-up ticket. `DEFAULT_TARGET` remains a single hard-coded URL, so the AC "switching target reloads browser" and "custom URL accepted/validated" are **not met**.
 
 ### ZF-023 — Embedding fallback (open-in-tab)
 - **Desc:** Detect load failure / blocked embedding on the float `<browser>`; surface inline "Open in tab" that promotes to a real tab. (EDD §6 E3, §11)

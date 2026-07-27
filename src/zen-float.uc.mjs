@@ -2,12 +2,18 @@
 // @name           Zen Float
 // @description    Persistent floating browser companion for Zen. v1 privileged userChrome script (fx-autoconfig/Sine).
 // @include        main
-// @version        0.0.2
+// @version        0.0.3
 // @author         Zen Float
 // ==/UserScript==
 //
 // ZF-001 — Bootstrap: manager scaffold + feature flag + ready hook.
 // ZF-002 — Overlay skeleton: FloatWindow shell (hidden .zen-float-overlay chrome frame).
+// ZF-022 — Ownership matrix, enforced structurally (one class per concern):
+//          BrowserHost → the tab + <browser> (the ONLY strong browser reference)
+//          EnrollmentManager → the three render attributes (ZF-021)
+//          TargetRegistry → page metadata (url/title/favicon/loading), event-driven
+//          FloatChrome → presentation (title bar), holds no browser/tab reference
+//          FloatWindow → composition, geometry and lifecycle; wires the four together.
 // C1     — No-move host model (Glance-faithful). The nested <browser> is NEVER reparented.
 //          .zen-float-overlay is a CHROME FRAME only. ZF-020 will style the float tab's OWN
 //          .browserSidebarContainer as the float (class .zen-float-browser), exactly like
@@ -155,6 +161,7 @@ class FloatWindow {
       --zen-float-inset-inline-end: 24px;
       --zen-float-radius: 12px;
       --zen-float-z: 2147483646;
+      --zen-float-chrome-height: 32px; /* ZF-022 title bar; reserved out of the browser box */
     }
 
     /* Chrome frame ONLY — never a <browser> parent. */
@@ -167,7 +174,11 @@ class FloatWindow {
       z-index: var(--zen-float-z);
       border-radius: var(--zen-float-radius);
       overflow: hidden;
-      background: Field;
+      /* ZF-022: transparent + inert. The frame sits ON TOP of the (never-moved) browser, so
+         an opaque background hid the page (defect F-1) and any pointer surface would have
+         eaten its clicks. Only FloatChrome re-enables pointer events, for its own bar. */
+      background: transparent;
+      pointer-events: none;
       box-shadow: 0 12px 48px rgba(0, 0, 0, 0.35);
       contain: layout style;           /* isolate from page layout */
     }
@@ -185,7 +196,9 @@ class FloatWindow {
       position: fixed;
       inset: auto var(--zen-float-inset-inline-end) var(--zen-float-inset-block-end) auto;
       width: var(--zen-float-width);
-      height: var(--zen-float-height);
+      /* Bottom-anchored, so shrinking by the bar height frees exactly the top strip the
+         ZF-022 title bar occupies — the two stay aligned with no imperative syncing. */
+      height: calc(var(--zen-float-height) - var(--zen-float-chrome-height));
       flex: unset !important;
     }
 
@@ -199,6 +212,8 @@ class FloatWindow {
   #frame = null;
   #host = new BrowserHost(); // ZF-022a: owns the tab + <browser> (no-move)
   #enrollment = null; // ZF-021 render-contract maintainer (borrows the host handle)
+  #registry = null; // ZF-022 metadata layer (borrows the host)
+  #chrome = null; // ZF-022 title bar (presentation only; no browser reference)
   #geometryTarget = null; // the node WE classed with .zen-float-browser (geometry is ours)
 
   get hasBrowser() {
@@ -208,6 +223,11 @@ class FloatWindow {
   /** Read-only access for the manager's debug/logging paths. Never handed to Chrome. */
   get host() {
     return this.#host;
+  }
+
+  /** ZF-022 — read-only metadata surface (manager debug + validation). */
+  get registry() {
+    return this.#registry;
   }
 
   #injectStyles() {
@@ -296,6 +316,15 @@ class FloatWindow {
       // onFatal = "our tab is being closed by someone else": tear down without touching the tab.
       this.#enrollment = new EnrollmentManager(() => this.detach({ removeTab: false }));
       this.#enrollment.enroll(this.#host.handle());
+      // ZF-022 — metadata then presentation. The registry borrows the host; the chrome only
+      // ever sees the registry + two owner callbacks, so it can never reach the browser.
+      this.#registry = new TargetRegistry();
+      this.#registry.attach(this.#host);
+      this.#chrome = new FloatChrome({
+        onClose: () => this.close(),
+        onReload: () => this.#host.reload(),
+      });
+      this.#chrome.attach(this.#frame, this.#registry);
       this.show();
       return browser;
     } catch (_) {
@@ -314,6 +343,17 @@ class FloatWindow {
    * outer `_beginRemoveTab`, which then throws on `browser.webProgress` (verified on 1.21.7b).
    */
   detach({ removeTab = true } = {}) {
+    // ZF-022 teardown order is deliberate: presentation, then metadata, then rendering, then
+    // the host. The registry must unhook while the browser is still alive — on the fatal path
+    // TabClose fires BEFORE any teardown (tabbrowser.js), so this still holds there.
+    if (this.#chrome) {
+      this.#chrome.detach();
+      this.#chrome = null;
+    }
+    if (this.#registry) {
+      this.#registry.detach();
+      this.#registry = null;
+    }
     // EnrollmentManager clears deck-selected + docShellIsActive + zenModeActive and disarms hooks.
     if (this.#enrollment) {
       this.#enrollment.destroy();
@@ -601,12 +641,523 @@ class EnrollmentManager {
   }
 }
 
+/**
+ * ZF-022 — TargetRegistry. Metadata layer for the float's page: URL, title, favicon and
+ * loading state, each with a `lastUpdated` stamp. It BORROWS the browser from BrowserHost at
+ * attach time; it never creates or removes tabs, never touches the render contract (ZF-021's
+ * three attributes), and nulls its browser reference on detach. Event-driven only — no
+ * polling, no timers, no retries. Extends EventTarget and emits CustomEvents:
+ *   "target-location" {url, previous, sameDocument} · "target-title"   {title, previous}
+ *   "target-favicon"  {favicon, previous}           · "target-loading" {loading}
+ *
+ * Source-verified behaviour (shipped 1.21.7b archives; cited because none of it is obvious):
+ * - **Load state:** tabbrowser's own TabProgressListener treats `STATE_START|STATE_IS_NETWORK`
+ *   and `STATE_STOP|STATE_IS_NETWORK` on an `isTopLevel` webProgress as page-load begin/end
+ *   (`tabbrowser.js:9647` / `:9724`). We apply the same test rather than inventing one.
+ * - **Title:** content fires `pagetitlechanged` on the browser; tabbrowser turns that into
+ *   `setTabTitle()` → `_setTabLabel()` → `_tabAttrModified(tab, ["label"])`
+ *   (`tabbrowser.js:9009`, `:2472`), dispatched as a bubbling `TabAttrModified` CustomEvent
+ *   on the TAB (`:2243`).
+ * - **Favicon:** `gBrowser.setIcon()` → `_tabAttrModified(tab, ["image"])` (`:1483`); the
+ *   resolved icon is `gBrowser.getIcon(tab)` === `browser.mIconURL` (`:1535`). We piggyback on
+ *   that pipeline and never fetch or parse an icon ourselves.
+ * - `_tabAttrModified` early-returns when `tab.closing` (`:2239`), so no metadata events can
+ *   arrive during teardown — the ZF-021d fatal path stays quiet by construction.
+ * - **REMOTENESS (investigated per ZF-022): a progress listener does NOT survive a process
+ *   switch.** `browser.webProgress` is `browsingContext?.webProgress`
+ *   (`browser-custom-element.mjs:644`), and tabbrowser removes its filter *before* the switch
+ *   and re-adds it *after* on BOTH paths: the frontend `updateBrowserRemoteness`
+ *   (`tabbrowser.js:2679` → `:2741`) and Gecko's Fission switch, hooked via
+ *   `WillChangeBrowserRemoteness`/`DidChangeBrowserRemoteness` (`:9288` → `:9371`;
+ *   the browser element fires those in `beforeChangeRemoteness`/`finishChangeRemoteness`,
+ *   `browser-custom-element.mjs:1989`/`:2000`). Both paths end by dispatching
+ *   `TabRemotenessChange` on the tab, which is where we re-register.
+ */
+class TargetRegistry extends EventTarget {
+  #host = null;
+  #tab = null;
+  #browser = null; // borrowed; nulled on detach
+  #progress = null; // nsIWebProgressListener
+  #listeners = []; // [{ target, type, fn }]
+  #inflight = 0; // outstanding top-level network loads (see #onStateChange)
+  #state = { url: null, title: null, favicon: null, loading: false };
+  #lastUpdated = { url: 0, title: 0, favicon: 0, loading: 0 };
+
+  get attached() {
+    return !!this.#host;
+  }
+
+  /** Snapshot of current metadata (copy — callers cannot mutate registry state). */
+  get state() {
+    return { ...this.#state, lastUpdated: { ...this.#lastUpdated } };
+  }
+
+  // ---- lifecycle (idempotent, symmetric with EnrollmentManager) ----------
+  attach(host) {
+    if (!host || !host.alive) {
+      return false;
+    }
+    if (this.#host === host) {
+      return true; // double attach → no-op
+    }
+    if (this.#host) {
+      this.detach(); // re-attach to a different host: never stack listeners
+    }
+    this.#host = host;
+    this.#tab = host.tab;
+    this.#browser = host.browser;
+    this.#armProgress();
+    this.#armTabListeners();
+    this.#refresh(); // seed from the live browser/tab (about:blank, initial icon, busy state)
+    return true;
+  }
+
+  detach() {
+    if (!this.#host) {
+      return; // double detach → no-op
+    }
+    this.#disarmProgress();
+    this.#disarmTabListeners();
+    this.#host = null;
+    this.#tab = null;
+    this.#browser = null;
+    this.#inflight = 0;
+    this.#state.loading = false; // silent: the surface is going away with us
+  }
+
+  // ---- state plumbing ---------------------------------------------------
+  // One funnel, conditional emit: a field that did not change emits nothing, so a duplicate
+  // or late notification is inert.
+  #set(field, value, extra = null) {
+    if (this.#state[field] === value) {
+      return false;
+    }
+    const previous = this.#state[field];
+    this.#state[field] = value;
+    this.#lastUpdated[field] = Date.now();
+    const type =
+      field === "url"
+        ? "target-location"
+        : field === "title"
+          ? "target-title"
+          : field === "favicon"
+            ? "target-favicon"
+            : "target-loading";
+    const detail = field === "loading" ? { loading: value } : { [field]: value, previous };
+    try {
+      this.dispatchEvent(new CustomEvent(type, { detail: extra ? { ...detail, ...extra } : detail }));
+    } catch (_) {}
+    return true;
+  }
+
+  /**
+   * Re-read every field from the LIVE source of truth. This is the anti-staleness rule of
+   * this component: notifications are treated as *triggers only* and never as carriers of
+   * values, so a late or out-of-order event can never apply an old URL/title/icon — the
+   * worst it can do is re-read the current one and emit nothing.
+   */
+  #refresh({ sameDocument = false } = {}) {
+    if (!this.#browser) {
+      return;
+    }
+    let url = null;
+    try {
+      url = this.#browser.currentURI?.spec ?? null;
+    } catch (_) {}
+    this.#set("url", url, { sameDocument });
+
+    let title = null;
+    try {
+      title = this.#browser.contentTitle || this.#tab?.label || null;
+    } catch (_) {
+      title = this.#tab?.label ?? null;
+    }
+    this.#set("title", title);
+
+    let favicon = null;
+    try {
+      favicon = window.gBrowser?.getIcon?.(this.#tab) ?? null; // resolved icon, not fetched
+    } catch (_) {}
+    this.#set("favicon", favicon);
+  }
+
+  // ---- nsIWebProgressListener ------------------------------------------
+  #armProgress() {
+    this.#disarmProgress();
+    const browser = this.#browser;
+    if (!browser) {
+      return;
+    }
+    const self = this;
+    this.#progress = {
+      QueryInterface: ChromeUtils.generateQI([
+        "nsIWebProgressListener",
+        "nsISupportsWeakReference",
+      ]),
+      onStateChange(wp, request, flags, status) {
+        self.#onStateChange(wp, request, flags, status);
+      },
+      onLocationChange(wp, request, location, flags) {
+        self.#onLocationChange(wp, request, location, flags);
+      },
+      onProgressChange() {},
+      onSecurityChange() {},
+      onStatusChange() {},
+      onContentBlockingEvent() {},
+    };
+    try {
+      browser.addProgressListener(
+        this.#progress,
+        Ci.nsIWebProgress.NOTIFY_STATE_ALL | Ci.nsIWebProgress.NOTIFY_LOCATION
+      );
+    } catch (_) {
+      this.#progress = null; // browser not built yet / already torn down — stay inert
+    }
+  }
+
+  #disarmProgress() {
+    if (!this.#progress) {
+      return;
+    }
+    try {
+      // May throw if the browser is mid-teardown (webProgress is browsingContext-bound and
+      // is already gone) — the listener dies with the browsing context either way.
+      this.#browser?.removeProgressListener(this.#progress);
+    } catch (_) {}
+    this.#progress = null;
+  }
+
+  /**
+   * Loading state. Counting in-flight top-level network loads (rather than latching a
+   * boolean) is what makes rapid navigation correct: a STOP belonging to a superseded
+   * navigation decrements the count instead of clearing a flag the newer load just set.
+   */
+  #onStateChange(wp, _request, flags, _status) {
+    if (!this.#browser || !wp?.isTopLevel) {
+      return;
+    }
+    const { STATE_START, STATE_STOP, STATE_IS_NETWORK } = Ci.nsIWebProgressListener;
+    if (flags & STATE_START && flags & STATE_IS_NETWORK) {
+      this.#inflight++;
+      this.#set("loading", true);
+    } else if (flags & STATE_STOP && flags & STATE_IS_NETWORK) {
+      this.#inflight = Math.max(0, this.#inflight - 1);
+      this.#set("loading", this.#inflight > 0);
+      this.#refresh(); // title/icon usually land around STOP
+    }
+  }
+
+  #onLocationChange(wp, _request, _location, flags) {
+    if (!this.#browser || !wp?.isTopLevel) {
+      return; // iframe/subframe navigations are not the float's target
+    }
+    const sameDocument = !!(
+      flags & Ci.nsIWebProgressListener.LOCATION_CHANGE_SAME_DOCUMENT
+    );
+    this.#refresh({ sameDocument });
+  }
+
+  // ---- tab-scoped DOM listeners ----------------------------------------
+  // Scoped to the float's OWN tab: no cross-tab filtering needed, and nothing can fire for
+  // another tab's metadata. All are removed in #disarmTabListeners (incl. the fatal path).
+  #armTabListeners() {
+    this.#disarmTabListeners();
+    const tab = this.#tab;
+    if (!tab) {
+      return;
+    }
+    const add = (target, type, fn) => {
+      target.addEventListener(type, fn);
+      this.#listeners.push({ target, type, fn });
+    };
+    add(tab, "TabAttrModified", (e) => {
+      const changed = e?.detail?.changed;
+      if (!Array.isArray(changed)) {
+        return;
+      }
+      if (changed.includes("label") || changed.includes("image")) {
+        this.#refresh();
+      }
+    });
+    // Remoteness: our listener is bound to the OLD browsing context's webProgress, so it is
+    // dropped by the process switch exactly like tabbrowser's own filter. Unhook early,
+    // re-hook on the new one — same two-phase dance tabbrowser does (see class comment).
+    add(tab, "BeforeTabRemotenessChange", () => this.#disarmProgress());
+    add(tab, "TabRemotenessChange", () => {
+      this.#browser = this.#host?.browser ?? this.#browser; // same element, new frameLoader
+      this.#armProgress();
+      this.#refresh();
+    });
+  }
+
+  #disarmTabListeners() {
+    for (const { target, type, fn } of this.#listeners) {
+      try {
+        target.removeEventListener(type, fn);
+      } catch (_) {}
+    }
+    this.#listeners = [];
+  }
+}
+
+/**
+ * ZF-022 — FloatChrome. Read-only native title bar rendered inside the FloatWindow shell:
+ * favicon, title, throbber, reload, close. Presentation ONLY — it holds no browser and no
+ * tab reference, ever: it reads metadata from TargetRegistry events and routes both of its
+ * actions back through owner callbacks (`onClose` → FloatWindow.close(), `onReload` →
+ * BrowserHost.reload()). It never calls gBrowser, never touches the tab, and never writes a
+ * render attribute. Plain DOM, no frameworks; styling matches the existing float shell.
+ */
+class FloatChrome {
+  static BAR_CLASS = "zen-float-chrome";
+  static STYLE_ID = "zen-float-chrome-styles";
+  static STYLES = `
+    .zen-float-chrome {
+      pointer-events: auto;            /* the frame itself is inert (see .zen-float-overlay) */
+      box-sizing: border-box;
+      height: var(--zen-float-chrome-height);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 6px 0 10px;
+      background: Field;
+      color: FieldText;
+      border-bottom: 1px solid color-mix(in srgb, FieldText 12%, transparent);
+      border-radius: var(--zen-float-radius) var(--zen-float-radius) 0 0;
+      font: message-box;
+      font-size: 12px;
+      user-select: none;
+    }
+    .zen-float-chrome-icon {
+      width: 16px; height: 16px; flex: none;
+      border-radius: 3px;
+      background: color-mix(in srgb, FieldText 10%, transparent); /* placeholder until real */
+      object-fit: contain;
+    }
+    .zen-float-chrome-icon[data-has-icon="true"] { background: transparent; }
+    /* Throbber replaces the icon while loading. CSS animation only — no JS timer/polling. */
+    .zen-float-chrome[loading] .zen-float-chrome-icon { visibility: hidden; }
+    .zen-float-chrome-throbber {
+      display: none;
+      position: absolute;
+      width: 14px; height: 14px; flex: none;
+      border: 2px solid color-mix(in srgb, FieldText 25%, transparent);
+      border-top-color: AccentColor;
+      border-radius: 50%;
+      animation: zen-float-spin 0.7s linear infinite;
+    }
+    .zen-float-chrome[loading] .zen-float-chrome-throbber { display: block; }
+    @keyframes zen-float-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .zen-float-chrome-throbber { animation-duration: 2.4s; }
+    }
+    .zen-float-chrome-title {
+      flex: 1 1 auto;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;          /* truncation is CSS's job, not JS's */
+    }
+    .zen-float-chrome-button {
+      flex: none;
+      width: 24px; height: 24px;
+      display: flex; align-items: center; justify-content: center;
+      padding: 0; border: none; border-radius: 4px;
+      background: transparent; color: inherit;
+      font-size: 13px; line-height: 1;
+      cursor: default;
+    }
+    .zen-float-chrome-button:hover { background: color-mix(in srgb, FieldText 12%, transparent); }
+    .zen-float-chrome-button:active { background: color-mix(in srgb, FieldText 20%, transparent); }
+  `;
+
+  #bar = null;
+  #icon = null;
+  #label = null;
+  #registry = null;
+  #registryListeners = []; // [{ type, fn }]
+  #domListeners = []; // [{ target, type, fn }]
+  #onClose = null;
+  #onReload = null;
+
+  constructor({ onClose = null, onReload = null } = {}) {
+    this.#onClose = onClose;
+    this.#onReload = onReload;
+  }
+
+  get element() {
+    return this.#bar;
+  }
+
+  // ---- lifecycle (idempotent, symmetric with TargetRegistry) ------------
+  attach(frame, registry) {
+    if (!frame || !registry) {
+      return null;
+    }
+    if (this.#bar && this.#registry === registry) {
+      return this.#bar; // double attach → no-op
+    }
+    if (this.#bar) {
+      this.detach();
+    }
+    this.#injectStyles();
+    this.#build(frame);
+    this.#registry = registry;
+    const on = (type, fn) => {
+      registry.addEventListener(type, fn);
+      this.#registryListeners.push({ type, fn });
+    };
+    on("target-title", (e) => this.#renderTitle(e.detail?.title, null));
+    on("target-location", (e) => this.#renderTitle(null, e.detail?.url));
+    on("target-favicon", (e) => this.#renderFavicon(e.detail?.favicon));
+    on("target-loading", (e) => this.#renderLoading(!!e.detail?.loading));
+    this.#render(registry.state); // seed from whatever the registry already knows
+    return this.#bar;
+  }
+
+  detach() {
+    for (const { type, fn } of this.#registryListeners) {
+      try {
+        this.#registry?.removeEventListener(type, fn);
+      } catch (_) {}
+    }
+    this.#registryListeners = [];
+    for (const { target, type, fn } of this.#domListeners) {
+      try {
+        target.removeEventListener(type, fn);
+      } catch (_) {}
+    }
+    this.#domListeners = [];
+    this.#registry = null;
+    if (this.#bar) {
+      this.#bar.remove();
+      this.#bar = null;
+    }
+    this.#icon = null;
+    this.#label = null;
+  }
+
+  // ---- DOM --------------------------------------------------------------
+  #injectStyles() {
+    if (document.getElementById(FloatChrome.STYLE_ID)) {
+      return;
+    }
+    const style = document.createElementNS(XHTML_NS, "style");
+    style.id = FloatChrome.STYLE_ID;
+    style.textContent = FloatChrome.STYLES;
+    document.documentElement.appendChild(style);
+  }
+
+  #build(frame) {
+    const el = (tag, cls) => {
+      const node = document.createElementNS(XHTML_NS, tag);
+      if (cls) {
+        node.className = cls;
+      }
+      return node;
+    };
+    const bar = el("div", FloatChrome.BAR_CLASS);
+
+    const iconSlot = el("div", "zen-float-chrome-iconslot");
+    iconSlot.style.position = "relative";
+    iconSlot.style.display = "flex";
+    iconSlot.style.alignItems = "center";
+    const icon = el("img", "zen-float-chrome-icon");
+    icon.setAttribute("data-has-icon", "false");
+    const throbber = el("div", "zen-float-chrome-throbber");
+    iconSlot.append(icon, throbber);
+
+    const label = el("span", "zen-float-chrome-title");
+
+    const reload = el("button", "zen-float-chrome-button");
+    reload.textContent = "⟳"; // ⟳
+    reload.setAttribute("title", "Reload");
+    const close = el("button", "zen-float-chrome-button");
+    close.textContent = "✕"; // ✕
+    close.setAttribute("title", "Close");
+
+    const click = (target, fn) => {
+      const handler = (e) => {
+        e.preventDefault();
+        try {
+          fn();
+        } catch (_) {}
+      };
+      target.addEventListener("click", handler);
+      this.#domListeners.push({ target, type: "click", fn: handler });
+    };
+    // Chrome never touches the browser or the tab: both actions go through the owner.
+    click(reload, () => this.#onReload?.());
+    click(close, () => this.#onClose?.());
+
+    bar.append(iconSlot, label, reload, close);
+    frame.prepend(bar);
+    this.#bar = bar;
+    this.#icon = icon;
+    this.#label = label;
+  }
+
+  // ---- rendering --------------------------------------------------------
+  #render(state) {
+    if (!state) {
+      return;
+    }
+    this.#renderTitle(state.title, state.url);
+    this.#renderFavicon(state.favicon);
+    this.#renderLoading(!!state.loading);
+  }
+
+  // Title falls back to the URL when the page has none yet (mirrors tab-strip behaviour).
+  #renderTitle(title, url) {
+    if (!this.#label) {
+      return;
+    }
+    const next = title || url || this.#label.textContent || "";
+    if (title || !this.#label.textContent) {
+      this.#label.textContent = next;
+      this.#label.setAttribute("title", next);
+    }
+  }
+
+  #renderFavicon(favicon) {
+    if (!this.#icon) {
+      return;
+    }
+    if (favicon) {
+      // The already-resolved icon from tabbrowser's pipeline (gBrowser.getIcon) — the same
+      // value the tab strip renders. We never fetch one ourselves.
+      if (this.#icon.getAttribute("src") !== favicon) {
+        this.#icon.setAttribute("src", favicon);
+      }
+      this.#icon.setAttribute("data-has-icon", "true");
+    } else {
+      this.#icon.removeAttribute("src");
+      this.#icon.setAttribute("data-has-icon", "false"); // placeholder square
+    }
+  }
+
+  #renderLoading(loading) {
+    if (!this.#bar) {
+      return;
+    }
+    if (loading) {
+      if (!this.#bar.hasAttribute("loading")) {
+        this.#bar.setAttribute("loading", "true");
+      }
+    } else if (this.#bar.hasAttribute("loading")) {
+      this.#bar.removeAttribute("loading");
+    }
+  }
+}
+
 class nsZenFloatManager {
   // ---- constants --------------------------------------------------------
   static PREF_ENABLED = "zen.float.enabled";
   static PREF_DEBUG = "zen.float.debug";
   static READY_TOPIC = "browser-delayed-startup-finished";
-  static DEFAULT_TARGET = "https://claude.ai/"; // single default until TargetRegistry (ZF-022)
+  // Single default target. Target PRESETS (Claude/ChatGPT/… picker) are still unbuilt — see
+  // the ADR: ZF-022's TargetRegistry is the metadata layer, not the backlog's preset list.
+  static DEFAULT_TARGET = "https://claude.ai/";
 
   // Zen internals ZF depends on. Presence is feature-detected at init so a browser
   // update that renames one degrades gracefully (disable + notice) instead of throwing.
@@ -800,6 +1351,16 @@ class nsZenFloatManager {
       "active=" + browser.docShellIsActive
     );
     return true;
+  }
+
+  /** ZF-022 debug: current target metadata (url/title/favicon/loading + lastUpdated). */
+  _debugTargetState() {
+    return this.floatWindow?.registry?.state ?? null;
+  }
+
+  /** ZF-022 — reload the float's page (same path the title bar's button takes). */
+  reloadFloat() {
+    return !!this.floatWindow?.host?.reload();
   }
 
   /** ZF-020 — close the float and tear down its browser. */
