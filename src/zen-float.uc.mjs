@@ -14,6 +14,10 @@
 //          TargetRegistry → page metadata (url/title/favicon/loading), event-driven
 //          FloatChrome → presentation (title bar), holds no browser/tab reference
 //          FloatWindow → composition, geometry and lifecycle; wires the four together.
+// ZF-023 — TargetPresets (pure model: preset list + URL validation, no browser/DOM) +
+//          target switching: BrowserHost.navigate() reuses the SAME tab and browser, so a
+//          switch never respawns the host; FloatChrome gains a picker that routes through
+//          FloatWindow.switchTarget() and renders the validation verdict it gets back.
 // C1     — No-move host model (Glance-faithful). The nested <browser> is NEVER reparented.
 //          .zen-float-overlay is a CHROME FRAME only. ZF-020 will style the float tab's OWN
 //          .browserSidebarContainer as the float (class .zen-float-browser), exactly like
@@ -31,6 +35,107 @@
 "use strict";
 
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
+
+/**
+ * ZF-023 — TargetPresets. Pure model layer: the preset list + URL validation. No browser
+ * access, no DOM, no persistence (the float always opens on the default preset for now).
+ * Closes ADR-022 D-4: this is the "target presets" the backlog's ZF-022 asked for, kept
+ * separate from TargetRegistry (which is page metadata).
+ *
+ * Preset list is exactly the one named in the PRD (`ZEN_FLOAT_RFC.md:283`). Descriptors carry
+ * `type:"web"` so the EDD §13 extension (`type:"internal"` → chrome panel instead of a
+ * <browser>) can be added without changing the shape.
+ */
+const TargetPresets = {
+  // Scheme ALLOWLIST — everything not listed is rejected. Rationale per rejected class:
+  //   javascript: → executes script in the loaded document's context (script injection)
+  //   data:       → arbitrary HTML/JS under an opaque origin (injection + UI spoofing)
+  //   file:       → local filesystem read access from a chrome-triggered load
+  //   chrome:/resource:/about: → privileged browser internals; a chrome-privileged document
+  //                              in the float would expose internal UI and APIs
+  //   everything else (ftp:, blob:, moz-extension:, custom handlers…) → not needed by a web
+  //                              companion surface, so denied by default rather than audited
+  ALLOWED_SCHEMES: ["https", "http"],
+
+  LIST: [
+    { id: "claude", label: "Claude", url: "https://claude.ai/", iconHint: "C", type: "web" },
+    { id: "chatgpt", label: "ChatGPT", url: "https://chatgpt.com/", iconHint: "G", type: "web" },
+    { id: "gemini", label: "Gemini", url: "https://gemini.google.com/", iconHint: "◆", type: "web" },
+    { id: "perplexity", label: "Perplexity", url: "https://www.perplexity.ai/", iconHint: "P", type: "web" },
+    { id: "deepwiki", label: "DeepWiki", url: "https://deepwiki.com/", iconHint: "D", type: "web" },
+    { id: "github", label: "GitHub", url: "https://github.com/", iconHint: "○", type: "web" },
+    { id: "notion", label: "Notion", url: "https://www.notion.so/", iconHint: "N", type: "web" },
+    { id: "slack", label: "Slack", url: "https://app.slack.com/", iconHint: "S", type: "web" },
+  ],
+
+  get defaultPreset() {
+    return this.LIST[0];
+  },
+
+  byId(id) {
+    return this.LIST.find((p) => p.id === id) || null;
+  },
+
+  /** Plain-data copy for the presentation layer (FloatChrome renders it, never imports us). */
+  forDisplay() {
+    return this.LIST.map(({ id, label, url, iconHint }) => ({ id, label, url, iconHint }));
+  },
+
+  /**
+   * Validate + normalise a user-supplied URL string. Never throws: returns a RESULT so the
+   * chrome layer can render an invalid state and load nothing.
+   *   → { ok: true, url, uri, scheme } | { ok: false, code, reason }
+   *
+   * Fixup uses `Services.uriFixup.getFixupURIInfo(str, flags)` (`modules/URIFixup.sys.mjs:266`)
+   * — the same pathway the urlbar uses (`UrlbarInput.mjs:1423`). Deliberate difference: the
+   * urlbar passes FIXUP_FLAG_ALLOW_KEYWORD_LOOKUP so non-URL input becomes a *search*; we do
+   * NOT — this is a target field, not a search box, so "hello world" must be rejected rather
+   * than silently turned into a search query. FIX_SCHEME_TYPOS is kept ("htp://" → "http://").
+   */
+  validate(input) {
+    const raw = typeof input === "string" ? input.trim() : "";
+    if (!raw) {
+      return { ok: false, code: "empty", reason: "Enter a URL" };
+    }
+    let uri = null;
+    try {
+      const flags = Ci.nsIURIFixup.FIXUP_FLAG_FIX_SCHEME_TYPOS;
+      uri = Services.uriFixup.getFixupURIInfo(raw, flags)?.preferredURI ?? null;
+    } catch (_) {
+      uri = null; // getFixupURIInfo throws on input it cannot make a URI of
+    }
+    if (!uri) {
+      return { ok: false, code: "unparsable", reason: "Not a valid URL" };
+    }
+    if (!this.ALLOWED_SCHEMES.includes(uri.scheme)) {
+      return {
+        ok: false,
+        code: "blocked-scheme",
+        reason: `${uri.scheme}: URLs are not allowed`,
+        scheme: uri.scheme,
+      };
+    }
+    return { ok: true, url: uri.spec, uri, scheme: uri.scheme };
+  },
+
+  /**
+   * Resolve a preset id, a preset object, or a raw URL string to a load target. Preset URLs
+   * still go through validate() — one gate, no bypass, even for our own list.
+   */
+  resolve(presetOrUrl) {
+    if (!presetOrUrl) {
+      return { ok: false, code: "empty", reason: "No target" };
+    }
+    if (typeof presetOrUrl === "object" && presetOrUrl.url) {
+      return { ...this.validate(presetOrUrl.url), preset: presetOrUrl.id ?? null };
+    }
+    const preset = typeof presetOrUrl === "string" ? this.byId(presetOrUrl) : null;
+    if (preset) {
+      return { ...this.validate(preset.url), preset: preset.id };
+    }
+    return { ...this.validate(presetOrUrl), preset: null };
+  },
+};
 
 /**
  * ZF-022a — BrowserHost. Owns the float's hidden tab and its `<browser>`, and is the ONLY
@@ -99,6 +204,45 @@ class BrowserHost {
   /** Borrowed handle for EnrollmentManager (ZF-021). The host stays the owner. */
   handle() {
     return { tab: this.#tab, browser: this.#browser, container: this.#container };
+  }
+
+  /**
+   * ZF-023 — navigate the EXISTING browser to an already-validated target. Switching targets
+   * must never close and respawn the tab: the browser, its enrollment and its metadata
+   * subscriptions all survive, and only the document changes. A cross-origin switch triggers
+   * a Fission process switch, which is exactly the case TargetRegistry re-registers for.
+   *
+   * Takes an nsIURI (TargetPresets.validate produced it) and loads it with
+   * `loadURI(uri, {triggeringPrincipal})` — `browser-custom-element.mjs:905` — rather than
+   * `fixupAndLoadURIString`, so the browser loads EXACTLY the URI that passed the scheme
+   * allowlist; re-fixing up a string at load time could yield a different URI than the one
+   * validated. System principal is correct here for the same reason the urlbar uses it for
+   * user-typed navigation (`UrlbarInput.mjs:4335-4338` branches on
+   * `triggeringPrincipal.isSystemPrincipal` as the normal urlbar path): the load is initiated
+   * by the user through privileged UI, not by web content. The scheme allowlist upstream is
+   * what keeps that principal from being dangerous.
+   */
+  navigate(uri) {
+    const browser = this.#browser;
+    if (!browser || !uri) {
+      return false;
+    }
+    let target = uri;
+    if (typeof uri === "string") {
+      try {
+        target = Services.io.newURI(uri); // callers should pass a validated nsIURI
+      } catch (_) {
+        return false;
+      }
+    }
+    try {
+      browser.loadURI(target, {
+        triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /**
@@ -323,8 +467,12 @@ class FloatWindow {
       this.#chrome = new FloatChrome({
         onClose: () => this.close(),
         onReload: () => this.#host.reload(),
+        // ZF-023: the picker hands back a preset id or a raw string; validation lives in the
+        // model, and the RESULT comes back so the chrome can render an invalid state.
+        onSwitchTarget: (presetOrUrl) => this.switchTarget(presetOrUrl),
       });
-      this.#chrome.attach(this.#frame, this.#registry);
+      // Presets are passed as plain data: FloatChrome renders them, never imports the model.
+      this.#chrome.attach(this.#frame, this.#registry, { presets: TargetPresets.forDisplay() });
       this.show();
       return browser;
     } catch (_) {
@@ -370,6 +518,27 @@ class FloatWindow {
   /** Public close entry point (ZF-022). Routes through the one teardown path. */
   close() {
     this.detach();
+  }
+
+  /**
+   * ZF-023 — switch the float to another target (preset id, preset object, or raw URL).
+   * Resolves through TargetPresets (the single validation gate), then reuses the existing
+   * tab + browser via BrowserHost.navigate — no respawn, so enrollment and metadata
+   * subscriptions are untouched. Returns the validation RESULT so the chrome layer can show
+   * an invalid state; it never throws and never loads anything on a rejected URL.
+   */
+  switchTarget(presetOrUrl) {
+    const resolved = TargetPresets.resolve(presetOrUrl);
+    if (!resolved.ok) {
+      return resolved;
+    }
+    if (!this.#host.alive) {
+      return { ok: false, code: "no-target", reason: "Float is not open" };
+    }
+    if (!this.#host.navigate(resolved.uri)) {
+      return { ok: false, code: "load-failed", reason: "Could not load that URL" };
+    }
+    return { ok: true, url: resolved.url, preset: resolved.preset ?? null };
   }
 
   /** Full teardown — detach the browser, then remove the frame (shared styles left in place). */
@@ -914,6 +1083,7 @@ class FloatChrome {
   static STYLES = `
     .zen-float-chrome {
       pointer-events: auto;            /* the frame itself is inert (see .zen-float-overlay) */
+      position: relative;              /* anchor for the ZF-023 picker panel */
       box-sizing: border-box;
       height: var(--zen-float-chrome-height);
       display: flex;
@@ -969,6 +1139,66 @@ class FloatChrome {
     }
     .zen-float-chrome-button:hover { background: color-mix(in srgb, FieldText 12%, transparent); }
     .zen-float-chrome-button:active { background: color-mix(in srgb, FieldText 20%, transparent); }
+
+    /* ---- ZF-023 target picker ---- */
+    .zen-float-chrome-title[role="button"] { cursor: default; }
+    .zen-float-chrome-chevron { font-size: 9px; opacity: 0.6; flex: none; }
+    .zen-float-picker {
+      position: absolute;
+      top: var(--zen-float-chrome-height);
+      inset-inline: 0;
+      z-index: 1;
+      display: none;
+      flex-direction: column;
+      padding: 6px;
+      gap: 2px;
+      background: Field;
+      color: FieldText;
+      border: 1px solid color-mix(in srgb, FieldText 15%, transparent);
+      border-radius: 0 0 8px 8px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+      font: message-box;
+      font-size: 12px;
+      pointer-events: auto;
+    }
+    .zen-float-picker[open] { display: flex; }
+    .zen-float-picker-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 5px 8px;
+      border: none; border-radius: 5px;
+      background: transparent; color: inherit;
+      font: inherit; text-align: start;
+      cursor: default;
+    }
+    .zen-float-picker-item:hover { background: color-mix(in srgb, FieldText 12%, transparent); }
+    .zen-float-picker-item[data-active="true"] { background: color-mix(in srgb, AccentColor 22%, transparent); }
+    .zen-float-picker-hint {
+      width: 16px; height: 16px; flex: none;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 3px;
+      background: color-mix(in srgb, FieldText 10%, transparent);
+      font-size: 9px;
+    }
+    .zen-float-picker-sep {
+      height: 1px; margin: 4px 2px;
+      background: color-mix(in srgb, FieldText 12%, transparent);
+    }
+    .zen-float-picker-input {
+      width: 100%; box-sizing: border-box;
+      padding: 5px 8px;
+      border: 1px solid color-mix(in srgb, FieldText 20%, transparent);
+      border-radius: 5px;
+      background: color-mix(in srgb, FieldText 5%, transparent);
+      color: inherit; font: inherit;
+    }
+    .zen-float-picker[invalid] .zen-float-picker-input { border-color: color-mix(in srgb, red 55%, FieldText); }
+    .zen-float-picker-error {
+      display: none;
+      padding: 2px 2px 0;
+      font-size: 11px;
+      color: color-mix(in srgb, red 60%, FieldText);
+    }
+    .zen-float-picker[invalid] .zen-float-picker-error { display: block; }
   `;
 
   #bar = null;
@@ -979,10 +1209,16 @@ class FloatChrome {
   #domListeners = []; // [{ target, type, fn }]
   #onClose = null;
   #onReload = null;
+  #onSwitchTarget = null; // ZF-023
+  #picker = null;
+  #pickerInput = null;
+  #pickerError = null;
+  #presets = [];
 
-  constructor({ onClose = null, onReload = null } = {}) {
+  constructor({ onClose = null, onReload = null, onSwitchTarget = null } = {}) {
     this.#onClose = onClose;
     this.#onReload = onReload;
+    this.#onSwitchTarget = onSwitchTarget;
   }
 
   get element() {
@@ -990,7 +1226,7 @@ class FloatChrome {
   }
 
   // ---- lifecycle (idempotent, symmetric with TargetRegistry) ------------
-  attach(frame, registry) {
+  attach(frame, registry, { presets = [] } = {}) {
     if (!frame || !registry) {
       return null;
     }
@@ -1000,6 +1236,7 @@ class FloatChrome {
     if (this.#bar) {
       this.detach();
     }
+    this.#presets = Array.isArray(presets) ? presets : [];
     this.#injectStyles();
     this.#build(frame);
     this.#registry = registry;
@@ -1030,11 +1267,15 @@ class FloatChrome {
     this.#domListeners = [];
     this.#registry = null;
     if (this.#bar) {
-      this.#bar.remove();
+      this.#bar.remove(); // the picker lives inside the bar → removed with it
       this.#bar = null;
     }
     this.#icon = null;
     this.#label = null;
+    this.#picker = null;
+    this.#pickerInput = null;
+    this.#pickerError = null;
+    this.#presets = [];
   }
 
   // ---- DOM --------------------------------------------------------------
@@ -1068,6 +1309,9 @@ class FloatChrome {
     iconSlot.append(icon, throbber);
 
     const label = el("span", "zen-float-chrome-title");
+    label.setAttribute("role", "button"); // ZF-023: the title doubles as the picker trigger
+    const chevron = el("span", "zen-float-chrome-chevron");
+    chevron.textContent = "▼";
 
     const reload = el("button", "zen-float-chrome-button");
     reload.textContent = "⟳"; // ⟳
@@ -1086,15 +1330,126 @@ class FloatChrome {
       target.addEventListener("click", handler);
       this.#domListeners.push({ target, type: "click", fn: handler });
     };
-    // Chrome never touches the browser or the tab: both actions go through the owner.
+    // Chrome never touches the browser or the tab: every action goes through the owner.
     click(reload, () => this.#onReload?.());
     click(close, () => this.#onClose?.());
 
-    bar.append(iconSlot, label, reload, close);
+    // ---- ZF-023 target picker: preset list + custom URL, rendered from PLAIN DATA ----
+    const picker = el("div", "zen-float-picker");
+    for (const preset of this.#presets) {
+      const item = el("button", "zen-float-picker-item");
+      item.setAttribute("data-preset-id", preset.id ?? "");
+      item.setAttribute("data-preset-url", preset.url ?? "");
+      const hint = el("span", "zen-float-picker-hint");
+      hint.textContent = preset.iconHint || (preset.label || "?").slice(0, 1);
+      const name = el("span", null);
+      name.textContent = preset.label ?? preset.url ?? "";
+      item.append(hint, name);
+      click(item, () => this.#commit(preset.id || preset.url));
+      picker.appendChild(item);
+    }
+    picker.appendChild(el("div", "zen-float-picker-sep"));
+    const input = el("input", "zen-float-picker-input");
+    input.setAttribute("type", "text");
+    input.setAttribute("placeholder", "Custom URL (https://…)");
+    const error = el("div", "zen-float-picker-error");
+    picker.append(input, error);
+
+    const key = (target, fn) => {
+      target.addEventListener("keydown", fn);
+      this.#domListeners.push({ target, type: "keydown", fn });
+    };
+    // Enter commits the custom URL, Escape closes. Bound on the panel so it works whether
+    // focus is in the input or on a preset item (keydown bubbles).
+    key(picker, (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (e.target === input) {
+          this.#commit(input.value);
+        }
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.#togglePicker(false);
+      }
+    });
+    click(label, () => this.#togglePicker());
+    click(chevron, () => this.#togglePicker());
+
+    bar.append(iconSlot, label, chevron, reload, close, picker);
     frame.prepend(bar);
     this.#bar = bar;
     this.#icon = icon;
     this.#label = label;
+    this.#picker = picker;
+    this.#pickerInput = input;
+    this.#pickerError = error;
+  }
+
+  // ---- picker behaviour --------------------------------------------------
+  #togglePicker(force = null) {
+    if (!this.#picker) {
+      return false;
+    }
+    const open = force === null ? !this.#picker.hasAttribute("open") : !!force;
+    if (open) {
+      this.#markActivePreset();
+      this.#picker.setAttribute("open", "true");
+      try {
+        this.#pickerInput?.focus();
+      } catch (_) {}
+    } else {
+      this.#picker.removeAttribute("open");
+      this.#showError(null);
+    }
+    return open;
+  }
+
+  /** Highlight the preset matching the page currently loaded (host comparison, best-effort). */
+  #markActivePreset() {
+    const current = this.#registry?.state?.url ?? "";
+    let host = "";
+    try {
+      host = new URL(current).host;
+    } catch (_) {}
+    for (const item of this.#picker.querySelectorAll(".zen-float-picker-item")) {
+      let match = false;
+      try {
+        match = !!host && new URL(item.getAttribute("data-preset-url")).host === host;
+      } catch (_) {}
+      item.setAttribute("data-active", match ? "true" : "false");
+    }
+  }
+
+  /**
+   * Hand the raw selection to the owner and render whatever verdict comes back. Validation
+   * lives in the model (TargetPresets) — the chrome only displays the result, so an invalid
+   * URL produces an inline error and no load.
+   */
+  #commit(presetOrUrl) {
+    const result = this.#onSwitchTarget?.(presetOrUrl);
+    if (result && result.ok === false) {
+      this.#showError(result.reason || "Invalid URL");
+      return false;
+    }
+    this.#showError(null);
+    if (this.#pickerInput) {
+      this.#pickerInput.value = "";
+    }
+    this.#togglePicker(false);
+    return true;
+  }
+
+  #showError(message) {
+    if (!this.#picker || !this.#pickerError) {
+      return;
+    }
+    if (message) {
+      this.#pickerError.textContent = message;
+      this.#picker.setAttribute("invalid", "true");
+    } else {
+      this.#pickerError.textContent = "";
+      this.#picker.removeAttribute("invalid");
+    }
   }
 
   // ---- rendering --------------------------------------------------------
@@ -1155,9 +1510,9 @@ class nsZenFloatManager {
   static PREF_ENABLED = "zen.float.enabled";
   static PREF_DEBUG = "zen.float.debug";
   static READY_TOPIC = "browser-delayed-startup-finished";
-  // Single default target. Target PRESETS (Claude/ChatGPT/… picker) are still unbuilt — see
-  // the ADR: ZF-022's TargetRegistry is the metadata layer, not the backlog's preset list.
-  static DEFAULT_TARGET = "https://claude.ai/";
+  // ZF-023: the default target is now the first preset (Claude). Selection is deliberately
+  // not persisted — the float always opens on the default until a persistence ticket lands.
+  static DEFAULT_TARGET = TargetPresets.defaultPreset.url;
 
   // Zen internals ZF depends on. Presence is feature-detected at init so a browser
   // update that renames one degrades gracefully (disable + notice) instead of throwing.
@@ -1356,6 +1711,24 @@ class nsZenFloatManager {
   /** ZF-022 debug: current target metadata (url/title/favicon/loading + lastUpdated). */
   _debugTargetState() {
     return this.floatWindow?.registry?.state ?? null;
+  }
+
+  /**
+   * ZF-023 — switch the float's target (preset id, preset object, or raw URL). Returns the
+   * validation result: `{ok:true,url}` or `{ok:false,code,reason}` — never throws.
+   */
+  switchTarget(presetOrUrl) {
+    if (!this.floatWindow) {
+      return { ok: false, code: "no-target", reason: "Float is not open" };
+    }
+    const result = this.floatWindow.switchTarget(presetOrUrl);
+    this.#trace("switchTarget", presetOrUrl, "→", result.ok ? result.url : result.code);
+    return result;
+  }
+
+  /** ZF-023 — the preset list (plain data), for debug/UI. */
+  get targets() {
+    return TargetPresets.forDisplay();
   }
 
   /** ZF-022 — reload the float's page (same path the title bar's button takes). */

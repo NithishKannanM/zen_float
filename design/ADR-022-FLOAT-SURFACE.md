@@ -26,7 +26,10 @@ Adding a title bar exposed defect **F-1** (`reviews/ZF-020-HEADFUL-VALIDATION.md
 
 **Why this is in scope even though geometry is not:** a title bar that is invisible (covered) or that covers page content is not a deliverable. This resolves F-1 as a side effect; drag/resize/docking remain out of scope and untouched. Verified visually: `reviews/evidence/zf022-title-bar.png`.
 
-## D-4 — This `TargetRegistry` is **not** the backlog's `TargetRegistry`
+## D-4 — This `TargetRegistry` is **not** the backlog's `TargetRegistry` · **CLOSED by ZF-023**
+
+> **Resolved.** ZF-023 shipped `TargetPresets` (the PRD's eight presets + custom-URL validation) and target switching via `BrowserHost.navigate()` / `FloatWindow.switchTarget()`. The two original ZF-022 ACs are now met. See `reviews/ZF-023-VALIDATION.md`. The naming split stands: `TargetRegistry` = page metadata, `TargetPresets` = the target list.
+
 
 `ZEN_FLOAT_BACKLOG.md` ZF-022 defines `TargetRegistry` as *target presets* (Claude/ChatGPT/Gemini/… + custom URL). The implementation ticket redefines the same name as the *page-metadata* layer. Both cannot be the same class.
 
