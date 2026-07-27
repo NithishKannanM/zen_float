@@ -201,7 +201,8 @@ class FloatWindow {
         this.#container.classList.add(FloatWindow.BROWSER_CLASS);
       }
       // Render enrollment + compositing + persistence are owned by EnrollmentManager (ZF-021).
-      this.#enrollment = new EnrollmentManager(() => this.detach());
+      // onFatal = "our tab is being closed by someone else": tear down without touching the tab.
+      this.#enrollment = new EnrollmentManager(() => this.detach({ removeTab: false }));
       this.#enrollment.enroll({
         tab: this.#floatTab,
         browser: this.#browser,
@@ -215,8 +216,16 @@ class FloatWindow {
     }
   }
 
-  /** Tear down the hosted browser (no-move reverse): unenroll, unclass, remove tab, hide. */
-  detach() {
+  /**
+   * Tear down the hosted browser (no-move reverse): unenroll, unclass, remove tab, hide.
+   * `removeTab:false` is the fatal path (EnrollmentManager `onFatal`): tabbrowser is already
+   * closing our tab, so we only drop references. Calling `removeTab` there would re-enter
+   * `tabbrowser.removeTab`, hit its "synchronously remove an already asynchronously closing
+   * tab" fastpath (`if (!animate && aTab.closing) { this._endRemoveTab(aTab); return; }` —
+   * `animate` has no default, so it is undefined here) and destroy the browser *inside* the
+   * outer `_beginRemoveTab`, which then throws on `browser.webProgress` (verified on 1.21.7b).
+   */
+  detach({ removeTab = true } = {}) {
     // EnrollmentManager clears deck-selected + docShellIsActive + zenModeActive and disarms hooks.
     if (this.#enrollment) {
       this.#enrollment.destroy();
@@ -228,9 +237,11 @@ class FloatWindow {
     }
     this.#browser = null;
     if (this.#floatTab) {
-      try {
-        window.gBrowser?.removeTab(this.#floatTab);
-      } catch (_) {}
+      if (removeTab) {
+        try {
+          window.gBrowser?.removeTab(this.#floatTab);
+        } catch (_) {}
+      }
       this.#floatTab = null;
     }
     this.hide();
@@ -414,6 +425,28 @@ class EnrollmentManager {
     });
   }
 
+  // Fatal path (design §3 event matrix, §6 failure recovery): the float tab was closed by
+  // something other than the owner ("close other tabs", a session op, adoption into another
+  // window). tabbrowser dispatches TabClose from `_beginRemoveTab` *before any teardown* and
+  // *after* setting `tab.closing = true` (tabbrowser.js: `aTab.closing = true` → dispatch),
+  // so (a) the handle is still readable here and (b) the owner's `removeTab` in its teardown
+  // path is short-circuited by the `aTab.closing` guard — no recursion, no double-remove.
+  // Any other tab closing leaves the float untouched (design §3: "TabClose (other tab) → none").
+  #onTabClose(event) {
+    const h = this.#handle;
+    if (!h || !event || event.target !== h.tab) {
+      return;
+    }
+    const fatal = this.#onFatal;
+    this.#onFatal = null; // fire at most once; the owner's teardown re-enters via destroy()
+    this.unenroll(); // drop observer/listeners/contract first: never leave a live hook on a dead tab
+    if (typeof fatal === "function") {
+      try {
+        fatal();
+      } catch (_) {}
+    }
+  }
+
   // Synchronous, pre-paint backstop: if any third party (split/customize/restore/deck)
   // strips deck-selected, restore it before the frame paints → no flicker.
   #armObserver() {
@@ -441,7 +474,7 @@ class EnrollmentManager {
     }
   }
 
-  // Approved hooks ONLY: TabSelect, Workspace, MozDOMFullscreen, Customize Mode, unload.
+  // Approved hooks ONLY: TabSelect, TabClose, Workspace, MozDOMFullscreen, Customize Mode, unload.
   #armListeners() {
     this.#disarmListeners(); // idempotent: never double-register
     const add = (target, type, fn, opts) => {
@@ -449,6 +482,7 @@ class EnrollmentManager {
       this.#listeners.push({ target, type, fn, opts });
     };
     add(window, "TabSelect", () => this.#scheduleReassert());
+    add(window, "TabClose", (e) => this.#onTabClose(e));
     add(window, "MozDOMFullscreen:Entered", () => this.suspend());
     add(window, "MozDOMFullscreen:Exited", () => this.resume());
     const toolbox = window.gNavToolbox || document.getElementById("navigator-toolbox");
